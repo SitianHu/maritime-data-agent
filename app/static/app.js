@@ -1,0 +1,122 @@
+const $ = (s, root = document) => root.querySelector(s);
+const $$ = (s, root = document) => [...root.querySelectorAll(s)];
+const state = { datasets: [], terms: [], model: null };
+const titles = {
+  chat: ['问数助手', '选择数据表，用自然语言获得答案'],
+  datasets: ['数据表', '管理已上传的数据文件'],
+  terms: ['术语库', '统一业务概念和计算口径'],
+  settings: ['模型设置', '选择你自己的模型 API'],
+};
+
+async function api(url, options = {}) {
+  const response = await fetch(url, options);
+  let body;
+  try { body = await response.json(); } catch { body = { detail: response.statusText }; }
+  if (!response.ok) throw new Error(body.detail || '请求失败');
+  return body;
+}
+
+function toast(text) {
+  const el = $('#toast'); el.textContent = text; el.classList.add('show');
+  setTimeout(() => el.classList.remove('show'), 2500);
+}
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+}
+
+function showView(name) {
+  $$('.nav').forEach(x => x.classList.toggle('active', x.dataset.view === name));
+  $$('.view').forEach(x => x.classList.toggle('active', x.id === `view-${name}`));
+  $('#page-title').textContent = titles[name][0]; $('#page-subtitle').textContent = titles[name][1];
+  if (name === 'terms') loadTerms();
+}
+
+$$('.nav').forEach(x => x.onclick = () => showView(x.dataset.view));
+$$('[data-jump]').forEach(x => x.onclick = () => showView(x.dataset.jump));
+
+function datasetOptions(includeAll = false) {
+  const head = includeAll ? '<option value="">全部数据表</option>' : '<option value="">请选择数据表</option>';
+  return head + state.datasets.map(d => `<option value="${d.id}">${escapeHtml(d.name)}</option>`).join('');
+}
+
+async function loadDatasets() {
+  state.datasets = await api('/api/datasets');
+  const chatValue = $('#chat-dataset').value;
+  $('#chat-dataset').innerHTML = datasetOptions();
+  $('#chat-dataset').value = state.datasets.some(d => d.id === chatValue) ? chatValue : (state.datasets[0]?.id || '');
+  $('#term-dataset-filter').innerHTML = datasetOptions(true);
+  $('[name="dataset_id"]', $('#term-form')).innerHTML = '<option value="">全局术语</option>' + state.datasets.map(d => `<option value="${d.id}">${escapeHtml(d.name)}</option>`).join('');
+  $('#dataset-list').innerHTML = state.datasets.length ? state.datasets.map(d => `
+    <article class="card"><h3>${escapeHtml(d.name)}</h3><p>${escapeHtml(d.source_file)}</p><small>${d.row_count.toLocaleString()} 行 · ${d.columns.length} 个字段</small>
+    <div class="card-footer"><span>${new Date(d.created_at).toLocaleString()}</span><button class="danger" data-delete-dataset="${d.id}">删除</button></div></article>`).join('') : '<div class="empty">还没有数据表，上传一个 CSV 或 Excel 开始问数。</div>';
+}
+
+$('#upload-open').onclick = () => $('#upload-dialog').showModal();
+$('#term-open').onclick = () => $('#term-dialog').showModal();
+$$('[data-close]').forEach(x => x.onclick = () => x.closest('dialog').close());
+
+$('#upload-form').onsubmit = async e => {
+  e.preventDefault(); const button = $('button.primary', e.target); button.disabled = true; button.textContent = '上传中…';
+  try { await api('/api/datasets', { method: 'POST', body: new FormData(e.target) }); e.target.reset(); $('#upload-dialog').close(); await loadDatasets(); toast('数据表上传成功'); }
+  catch (err) { toast(err.message); } finally { button.disabled = false; button.textContent = '开始上传'; }
+};
+
+$('#dataset-list').onclick = async e => {
+  const id = e.target.dataset.deleteDataset; if (!id || !confirm('确定删除这个数据表及其关联术语吗？')) return;
+  try { await api(`/api/datasets/${id}`, {method:'DELETE'}); await loadDatasets(); toast('数据表已删除'); } catch(err) { toast(err.message); }
+};
+
+async function loadTerms() {
+  const dataset = $('#term-dataset-filter').value, q = $('#term-search').value.trim();
+  state.terms = await api(`/api/terms?dataset_id=${encodeURIComponent(dataset)}&q=${encodeURIComponent(q)}`);
+  $('#term-list').innerHTML = state.terms.length ? state.terms.map(t => {
+    const ds = state.datasets.find(d => d.id === t.dataset_id);
+    return `<div class="term"><b>${escapeHtml(t.term)}<small>${escapeHtml(t.synonyms || '无同义词')}</small></b><span>${escapeHtml(t.definition)}</span><div><small>${escapeHtml(ds?.name || '全局')}</small> <button class="danger" data-delete-term="${t.id}">删除</button></div></div>`;
+  }).join('') : '<div class="empty">没有匹配的术语。</div>';
+}
+
+let searchTimer; $('#term-search').oninput = () => { clearTimeout(searchTimer); searchTimer = setTimeout(loadTerms, 250); };
+$('#term-dataset-filter').onchange = loadTerms;
+$('#term-form').onsubmit = async e => {
+  e.preventDefault(); const data = Object.fromEntries(new FormData(e.target)); data.dataset_id ||= null;
+  try { await api('/api/terms', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}); e.target.reset(); $('#term-dialog').close(); await loadTerms(); toast('术语已保存'); } catch(err) { toast(err.message); }
+};
+$('#term-list').onclick = async e => { const id=e.target.dataset.deleteTerm;if(!id)return;try{await api(`/api/terms/${id}`,{method:'DELETE'});await loadTerms();toast('术语已删除')}catch(err){toast(err.message)}};
+
+const providers = {
+  openai: {base_url:'https://api.openai.com/v1', model:'gpt-4.1-mini'},
+  deepseek: {base_url:'https://api.deepseek.com/v1', model:'deepseek-chat'},
+  qwen: {base_url:'https://dashscope.aliyuncs.com/compatible-mode/v1', model:'qwen-plus'},
+  custom: {base_url:'', model:''},
+};
+$$('[data-provider]').forEach(button => button.onclick = () => {
+  $$('[data-provider]').forEach(x => x.classList.remove('active')); button.classList.add('active');
+  const p=providers[button.dataset.provider]; $('#base-url').value=p.base_url; $('#model-name').value=p.model;
+});
+$('#toggle-key').onclick = () => { const x=$('#api-key');x.type=x.type==='password'?'text':'password';$('#toggle-key').textContent=x.type==='password'?'显示':'隐藏'; };
+function readModel() { return {api_key:$('#api-key').value.trim(),base_url:$('#base-url').value.trim(),model:$('#model-name').value.trim()}; }
+function saveModel() { state.model=readModel();sessionStorage.setItem('smart-query-model',JSON.stringify(state.model));updateModelStatus(); }
+function updateModelStatus(){const el=$('.status');el.classList.toggle('ready',!!state.model);$('#model-status').textContent=state.model?state.model.model:'未配置模型'}
+$('#model-form').onsubmit = e => { e.preventDefault();saveModel();toast('模型配置已保存到当前会话');showView('chat'); };
+$('#test-model').onclick = async () => { const el=$('#model-result');el.textContent='正在测试连接…';try{const result=await api('/api/model/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(readModel())});el.textContent=`✓ ${result.message}`;}catch(err){el.textContent=`连接失败：${err.message}`;} };
+
+function addMessage(role, content, details) {
+  $('.welcome')?.remove(); const wrap=document.createElement('div');wrap.className=`message ${role}`;
+  let extra=''; if(details){
+    const heads=details.columns.map(x=>`<th>${escapeHtml(x)}</th>`).join('');
+    const rows=details.rows.slice(0,30).map(r=>`<tr>${details.columns.map(c=>`<td>${escapeHtml(r[c])}</td>`).join('')}</tr>`).join('');
+    extra=`<details class="meta-panel"><summary>查看生成的 SQL 和查询结果</summary><pre>${escapeHtml(details.sql)}</pre>${rows?`<div class="result-table"><table><thead><tr>${heads}</tr></thead><tbody>${rows}</tbody></table></div>`:'<p>查询结果为空</p>'}</details>`;
+  }
+  wrap.innerHTML=`<div class="bubble">${escapeHtml(content)}${extra}</div>`;$('#messages').append(wrap);$('#messages').scrollTop=$('#messages').scrollHeight;return wrap;
+}
+$$('.examples button').forEach(x=>x.onclick=()=>{$('#question').value=x.textContent;$('#question').focus()});
+$('#ask-form').onsubmit = async e => {
+  e.preventDefault();const question=$('#question').value.trim(),dataset_id=$('#chat-dataset').value;if(!question)return;if(!dataset_id){toast('请先上传并选择数据表');showView('datasets');return}if(!state.model){toast('请先配置模型 API');showView('settings');return}
+  addMessage('user',question);$('#question').value='';const loading=addMessage('assistant','正在检索术语、生成 SQL 并查询数据…');$('.send').disabled=true;
+  try{const result=await api('/api/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset_id,question,model:state.model})});loading.remove();addMessage('assistant',result.answer,result)}catch(err){loading.remove();addMessage('assistant',`问数失败：${err.message}`)}finally{$('.send').disabled=false}
+};
+
+try { state.model=JSON.parse(sessionStorage.getItem('smart-query-model')); } catch {}
+if(state.model){$('#api-key').value=state.model.api_key;$('#base-url').value=state.model.base_url;$('#model-name').value=state.model.model}
+updateModelStatus(); loadDatasets().catch(err=>toast(err.message));
