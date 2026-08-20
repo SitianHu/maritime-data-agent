@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -149,13 +150,14 @@ async def test_model(payload: dict[str, Any]) -> dict[str, str]:
     try:
         config = ModelConfig.from_payload(payload)
         answer = await chat(config, [{"role": "user", "content": "只回复：连接成功"}])
-        return {"message": answer.strip()}
+        return {"message": answer.content.strip()}
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(400, str(exc)) from exc
 
 
 @app.post("/api/ask")
 async def ask(payload: AskRequest) -> dict[str, Any]:
+    started_at = time.perf_counter()
     dataset = db.get_dataset(payload.dataset_id)
     if not dataset:
         raise HTTPException(404, "数据集不存在")
@@ -164,19 +166,33 @@ async def ask(payload: AskRequest) -> dict[str, Any]:
         matched_terms = db.list_terms(payload.dataset_id)[:30]
     try:
         config = ModelConfig.from_payload(payload.model)
-        sql = await generate_sql(config, payload.question, dataset["table_name"], dataset["columns"], matched_terms)
+        sql, reasoning_summary, sql_call = await generate_sql(config, payload.question, dataset["table_name"], dataset["columns"], matched_terms)
         sql = validate_sql(sql, dataset["table_name"])
+        query_started_at = time.perf_counter()
         columns, rows, truncated = execute_readonly(sql)
-        answer = await summarize(config, payload.question, sql, columns, rows, truncated)
+        query_elapsed_ms = round((time.perf_counter() - query_started_at) * 1000)
+        answer_call = await summarize(config, payload.question, sql, columns, rows, truncated)
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(400, str(exc)) from exc
     return {
-        "answer": answer,
+        "answer": answer_call.content,
         "sql": sql,
         "columns": columns,
         "rows": rows,
         "truncated": truncated,
         "terms": [{"term": item["term"], "definition": item["definition"]} for item in matched_terms],
+        "reasoning_summary": reasoning_summary,
+        "metrics": {
+            "total_elapsed_ms": round((time.perf_counter() - started_at) * 1000),
+            "sql_generation_elapsed_ms": sql_call.elapsed_ms,
+            "query_elapsed_ms": query_elapsed_ms,
+            "answer_generation_elapsed_ms": answer_call.elapsed_ms,
+            "prompt_tokens": (sql_call.prompt_tokens or 0) + (answer_call.prompt_tokens or 0) if sql_call.prompt_tokens is not None and answer_call.prompt_tokens is not None else None,
+            "completion_tokens": (sql_call.completion_tokens or 0) + (answer_call.completion_tokens or 0) if sql_call.completion_tokens is not None and answer_call.completion_tokens is not None else None,
+            "total_tokens": (sql_call.total_tokens or 0) + (answer_call.total_tokens or 0) if sql_call.total_tokens is not None and answer_call.total_tokens is not None else None,
+            "sql_generation_tokens": sql_call.total_tokens,
+            "answer_generation_tokens": answer_call.total_tokens,
+        },
     }
 
 
@@ -186,4 +202,3 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 @app.get("/{path:path}", include_in_schema=False)
 def frontend(path: str = "") -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
-

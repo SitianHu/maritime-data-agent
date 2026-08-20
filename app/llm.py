@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,15 +27,25 @@ class ModelConfig:
         return cls(api_key=api_key, base_url=base_url, model=model)
 
 
+@dataclass
+class ChatResult:
+    content: str
+    elapsed_ms: int
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+
+
 def _chat_url(base_url: str) -> str:
     if base_url.endswith("/chat/completions"):
         return base_url
     return f"{base_url}/chat/completions"
 
 
-async def chat(config: ModelConfig, messages: list[dict[str, str]], temperature: float = 0) -> str:
+async def chat(config: ModelConfig, messages: list[dict[str, str]], temperature: float = 0) -> ChatResult:
     headers = {"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"}
     payload = {"model": config.model, "messages": messages, "temperature": temperature}
+    started_at = time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=90) as client:
             response = await client.post(_chat_url(config.base_url), headers=headers, json=payload)
@@ -45,7 +56,16 @@ async def chat(config: ModelConfig, messages: list[dict[str, str]], temperature:
     except httpx.HTTPError as exc:
         raise RuntimeError(f"无法连接模型接口：{exc}") from exc
     try:
-        return response.json()["choices"][0]["message"]["content"]
+        body = response.json()
+        content = body["choices"][0]["message"]["content"]
+        usage = body.get("usage") or {}
+        return ChatResult(
+            content=content,
+            elapsed_ms=round((time.perf_counter() - started_at) * 1000),
+            prompt_tokens=usage.get("prompt_tokens"),
+            completion_tokens=usage.get("completion_tokens"),
+            total_tokens=usage.get("total_tokens"),
+        )
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
         raise RuntimeError("模型接口返回格式不兼容 OpenAI Chat Completions") from exc
 
@@ -67,7 +87,7 @@ async def generate_sql(
     table_name: str,
     columns: list[dict[str, str]],
     terms: list[dict[str, Any]],
-) -> str:
+) -> tuple[str, str, ChatResult]:
     schema = "\n".join(f'- "{col["name"]}" ({col["type"]})' for col in columns)
     glossary = "\n".join(
         f'- {item["term"]}（同义词：{item["synonyms"] or "无"}）：{item["definition"]}' for item in terms
@@ -88,10 +108,19 @@ async def generate_sql(
 2. 只能生成 SELECT 或 WITH...SELECT，禁止任何写操作和 PRAGMA。
 3. SQLite 方言；中文字段和表名必须用双引号。
 4. 明细查询必须限制返回数量，最多 200 行；聚合查询可以不加 LIMIT。
-5. 只输出 SQL，不要解释，不要 Markdown。
+5. 返回 JSON，格式必须是：{{"reasoning_summary":"简要说明使用的字段、筛选、聚合、分组和排序逻辑","sql":"可执行 SQL"}}。
+6. reasoning_summary 只提供简洁、可核验的 SQL 生成依据，不输出隐藏推理或冗长思维链。
+7. 不要输出 Markdown 或 JSON 之外的内容。
 """
     result = await chat(config, [{"role": "system", "content": "你只负责生成安全、准确的 SQLite SQL。"}, {"role": "user", "content": prompt}])
-    return extract_sql(result)
+    reasoning_summary = "模型未返回 SQL 生成依据摘要。"
+    try:
+        parsed = json.loads(result.content.strip())
+        sql = extract_sql(str(parsed.get("sql", "")))
+        reasoning_summary = str(parsed.get("reasoning_summary") or reasoning_summary).strip()
+    except (json.JSONDecodeError, AttributeError):
+        sql = extract_sql(result.content)
+    return sql, reasoning_summary, result
 
 
 async def summarize(
@@ -101,7 +130,7 @@ async def summarize(
     columns: list[str],
     rows: list[dict[str, Any]],
     truncated: bool,
-) -> str:
+) -> ChatResult:
     data = json.dumps(rows[:100], ensure_ascii=False, default=str)
     prompt = f"""请根据 SQL 查询结果，用简洁、准确、自然的中文直接回答用户问题。
 
@@ -117,5 +146,6 @@ async def summarize(
 - 空结果要明确说明未查到符合条件的数据。
 - 只输出自然语言答案，不输出 JSON、图表或 Markdown 表格。
 """
-    return (await chat(config, [{"role": "system", "content": "你是严谨的数据分析助手。"}, {"role": "user", "content": prompt}], 0.1)).strip()
-
+    result = await chat(config, [{"role": "system", "content": "你是严谨的数据分析助手。"}, {"role": "user", "content": prompt}], 0.1)
+    result.content = result.content.strip()
+    return result
