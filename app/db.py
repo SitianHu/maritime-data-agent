@@ -139,8 +139,28 @@ def add_term(term: str, definition: str, synonyms: str, dataset_id: str | None) 
     return item
 
 
+def add_terms(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Insert a validated batch of terms in a single transaction."""
+    now = utc_now()
+    rows = [
+        {
+            "id": uuid.uuid4().hex,
+            "term": str(item["term"]).strip(),
+            "definition": str(item["definition"]).strip(),
+            "synonyms": str(item.get("synonyms", "")).strip(),
+            "dataset_id": item.get("dataset_id"),
+            "created_at": now,
+        }
+        for item in items
+    ]
+    with connection() as conn:
+        conn.executemany(
+            "INSERT INTO terms VALUES (:id, :term, :definition, :synonyms, :dataset_id, :created_at)", rows
+        )
+    return rows
+
+
 def delete_term(term_id: str) -> bool:
     with connection() as conn:
         cursor = conn.execute("DELETE FROM terms WHERE id = ?", (term_id,))
     return cursor.rowcount > 0
-

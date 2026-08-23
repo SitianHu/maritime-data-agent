@@ -71,15 +71,71 @@ async def chat(config: ModelConfig, messages: list[dict[str, str]], temperature:
         raise RuntimeError("模型接口返回格式不兼容 OpenAI Chat Completions") from exc
 
 
-def extract_sql(text: str) -> str:
-    fenced = re.search(r"```(?:sql)?\s*(.*?)```", text, flags=re.I | re.S)
-    sql = fenced.group(1).strip() if fenced else text.strip()
-    if sql.startswith("{"):
+def extract_response_json(text: str) -> dict[str, Any] | None:
+    value = text.strip()
+    fenced = re.search(r"```\s*(?:json|sql)?\s*\r?\n?(.*?)```", value, flags=re.I | re.S)
+    if fenced:
+        value = fenced.group(1).strip()
+
+    if value.startswith("{"):
         try:
-            sql = json.loads(sql).get("sql", sql)
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
         except json.JSONDecodeError:
             pass
+
+    # Some OpenAI-compatible providers add a short sentence before the JSON.
+    json_object = re.search(r'\{.*?"sql"\s*:\s*"(?:\\.|[^"\\])*".*?\}', value, flags=re.I | re.S)
+    if json_object:
+        try:
+            parsed = json.loads(json_object.group(0))
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+def extract_sql(text: str) -> str:
+    value = text.strip()
+    parsed = extract_response_json(value)
+    if parsed is not None:
+        sql: Any = parsed.get("sql", value)
+    else:
+        fenced = re.search(r"```\s*(?:sql)?\s*\r?\n?(.*?)```", value, flags=re.I | re.S)
+        sql = fenced.group(1).strip() if fenced else value
     return str(sql).strip().rstrip(";")
+
+
+def extract_reasoning_summary(text: str, sql: str) -> str:
+    """Return a concise rationale without relying on one provider-specific key."""
+    parsed = extract_response_json(text)
+    if parsed is not None:
+        normalized = {str(key).strip().lower(): value for key, value in parsed.items()}
+        for key in ("reasoning_summary", "reasoning", "rationale", "explanation", "summary", "依据摘要", "生成依据"):
+            value = normalized.get(key.lower())
+            if value is not None and str(value).strip():
+                return str(value).strip()
+
+    # Some compatible models only return SQL. Build a factual summary from the
+    # validated query shape so the UI still has useful, auditable information.
+    upper_sql = sql.upper()
+    actions: list[str] = []
+    if re.search(r"\b(COUNT|SUM|AVG|MIN|MAX)\s*\(", upper_sql):
+        actions.append("进行聚合统计")
+    if re.search(r"\bWHERE\b", upper_sql):
+        actions.append("按查询条件筛选数据")
+    if re.search(r"\bGROUP\s+BY\b", upper_sql):
+        actions.append("按指定字段分组")
+    if re.search(r"\bORDER\s+BY\b", upper_sql):
+        actions.append("按指定字段排序")
+    limit = re.search(r"\bLIMIT\s+(\d+)\b", upper_sql)
+    if limit:
+        actions.append(f"最多返回 {limit.group(1)} 条记录")
+    if not actions:
+        actions.append("查询与问题相关的字段和记录")
+    return "模型返回了可执行 SQL；该 SQL 将" + "、".join(actions) + "。"
 
 
 async def generate_sql(
@@ -124,13 +180,12 @@ async def generate_sql(
         config,
         [{"role": "system", "content": "你只负责生成安全、准确的 SQLite SQL。"}, {"role": "user", "content": prompt}],
     )
-    reasoning_summary = "模型未返回 SQL 生成依据摘要。"
-    try:
-        parsed = json.loads(result.content.strip())
+    parsed = extract_response_json(result.content)
+    if parsed is not None:
         sql = extract_sql(str(parsed.get("sql", "")))
-        reasoning_summary = str(parsed.get("reasoning_summary") or reasoning_summary).strip()
-    except (json.JSONDecodeError, AttributeError):
+    else:
         sql = extract_sql(result.content)
+    reasoning_summary = extract_reasoning_summary(result.content, sql)
     return sql, reasoning_summary, result
 
 

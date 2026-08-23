@@ -138,6 +138,87 @@ def create_term(payload: TermCreate) -> dict[str, Any]:
     return db.add_term(payload.term, payload.definition, payload.synonyms, payload.dataset_id)
 
 
+@app.post("/api/terms/import")
+async def import_terms(file: UploadFile = File(...)) -> dict[str, Any]:
+    filename = file.filename or "terms.xlsx"
+    if Path(filename).suffix.lower() not in {".xlsx", ".xls"}:
+        raise HTTPException(400, "仅支持 XLSX 和 XLS 文件")
+    content = await file.read()
+    if not content:
+        raise HTTPException(400, "上传的文件为空")
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(400, "术语文件不能超过 10 MB")
+    try:
+        frame = pd.read_excel(io.BytesIO(content), dtype=object)
+    except Exception as exc:
+        raise HTTPException(400, f"无法读取术语文件：{exc}") from exc
+
+    frame.columns = [str(column).strip() for column in frame.columns]
+    columns = ["术语", "定义", "同义词", "关联数据表"]
+    missing = set(columns).difference(frame.columns)
+    if missing:
+        raise HTTPException(400, f"缺少字段：{'、'.join(sorted(missing))}")
+
+    datasets_by_name: dict[str, list[dict[str, Any]]] = {}
+    for dataset in db.list_datasets():
+        datasets_by_name.setdefault(dataset["name"].strip(), []).append(dataset)
+    existing = {(item["term"].strip(), item.get("dataset_id")) for item in db.list_terms()}
+    pending: set[tuple[str, str | None]] = set()
+    rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+    skipped = 0
+
+    def cell_text(value: Any) -> str:
+        return "" if pd.isna(value) else str(value).strip()
+
+    for index, record in frame[columns].iterrows():
+        row_number = index + 2
+        term = cell_text(record["术语"])
+        definition = cell_text(record["定义"])
+        synonyms = cell_text(record["同义词"])
+        dataset_name = cell_text(record["关联数据表"])
+        is_global = dataset_name in {"全局术语", "全局"}
+        if not any((term, definition, synonyms, dataset_name)):
+            continue
+        if not term:
+            errors.append(f"第 {row_number} 行：术语不能为空")
+        if not definition:
+            errors.append(f"第 {row_number} 行：定义不能为空")
+        if len(term) > 100:
+            errors.append(f"第 {row_number} 行：术语不能超过 100 个字符")
+        if len(definition) > 1000:
+            errors.append(f"第 {row_number} 行：定义不能超过 1000 个字符")
+        if len(synonyms) > 500:
+            errors.append(f"第 {row_number} 行：同义词不能超过 500 个字符")
+        dataset_id = None
+        if dataset_name and not is_global:
+            matches = datasets_by_name.get(dataset_name, [])
+            if not matches:
+                errors.append(f"第 {row_number} 行：关联数据表“{dataset_name}”不存在")
+            elif len(matches) > 1:
+                errors.append(f"第 {row_number} 行：关联数据表“{dataset_name}”名称不唯一")
+            else:
+                dataset_id = matches[0]["id"]
+        if not term or not definition or (dataset_name and not is_global and dataset_id is None):
+            continue
+        key = (term, dataset_id)
+        if key in existing or key in pending:
+            skipped += 1
+            continue
+        pending.add(key)
+        rows.append({"term": term, "definition": definition, "synonyms": synonyms, "dataset_id": dataset_id})
+
+    if errors:
+        detail = "；".join(errors[:20])
+        if len(errors) > 20:
+            detail += f"；另有 {len(errors) - 20} 个错误"
+        raise HTTPException(400, detail)
+    if not rows and not skipped:
+        raise HTTPException(400, "文件中没有可导入的术语")
+    db.add_terms(rows)
+    return {"imported": len(rows), "skipped": skipped, "total": len(rows) + skipped}
+
+
 @app.delete("/api/terms/{term_id}")
 def remove_term(term_id: str) -> dict[str, bool]:
     if not db.delete_term(term_id):
@@ -238,7 +319,7 @@ async def ask(payload: AskRequest) -> dict[str, Any]:
             rows=rows,
             truncated=truncated,
         )
-        answer = await summarize(
+        answer_call = await summarize(
             config,
             payload.question,
             sql,

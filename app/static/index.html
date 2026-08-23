@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>智能问数</title>
-  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/style.css?v=20260823-terms-import" />
 </head>
 <body>
   <div class="shell">
@@ -39,7 +39,7 @@
       </section>
 
       <section id="view-terms" class="view">
-        <div class="section-head"><div><h2>术语库</h2><p>定义业务口径、别名和计算规则，帮助模型理解问题。</p></div><button class="primary" id="term-open">＋ 新增术语</button></div>
+        <div class="section-head"><div><h2>术语库</h2><p>定义业务口径、别名和计算规则，帮助模型理解问题。</p></div><div class="head-actions" style="display:flex;gap:9px"><button type="button" class="ghost" id="term-import-open">批量导入</button><button type="button" class="primary" id="term-open">＋ 新增术语</button></div></div>
         <div class="filter"><input id="term-search" placeholder="搜索术语或定义" /><select id="term-dataset-filter"></select></div>
         <div id="term-list" class="term-list"></div>
       </section>
@@ -62,7 +62,8 @@
 
   <dialog id="upload-dialog"><form id="upload-form"><div class="modal-head"><h3>上传数据表</h3><button type="button" data-close>×</button></div><label>数据集名称（可选）<input name="name" placeholder="默认使用文件名" /></label><label class="drop">选择 CSV / XLSX / XLS 文件<input name="file" type="file" accept=".csv,.xlsx,.xls" required /></label><div class="actions"><button type="button" class="ghost" data-close>取消</button><button class="primary">开始上传</button></div></form></dialog>
   <dialog id="term-dialog"><form id="term-form"><div class="modal-head"><h3>新增业务术语</h3><button type="button" data-close>×</button></div><label>术语<input name="term" required placeholder="例如：活跃客户" /></label><label>定义<textarea name="definition" required placeholder="例如：过去 30 天内至少下单一次的客户"></textarea></label><label>同义词<input name="synonyms" placeholder="例如：有效客户, 活客" /></label><label>关联数据表<select name="dataset_id"></select></label><div class="actions"><button type="button" class="ghost" data-close>取消</button><button class="primary">保存术语</button></div></form></dialog>
+  <dialog id="term-import-dialog"><form id="term-import-form"><div class="modal-head"><h3>批量导入术语</h3><button type="button" data-close>×</button></div><p class="dialog-tip">Excel 首行字段必须为：术语、定义、同义词、关联数据表。关联数据表可填写系统中的数据表名称；留空或填写“全局术语”表示全局范围。</p><label class="drop">选择 XLSX / XLS 文件<input name="file" type="file" accept=".xlsx,.xls" required /></label><div class="actions"><button type="button" class="ghost" data-close>取消</button><button class="primary">开始导入</button></div></form></dialog>
   <div id="toast"></div>
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=20260823-auto-route"></script>
 </body>
 </html>

@@ -30,11 +30,11 @@ function escapeHtml(value) {
 function createConversation() { return { id: crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`, title: '新对话', datasetId: '', messages: [], updatedAt: Date.now() }; }
 function activeConversation() { return state.conversations.find(item => item.id === state.activeConversationId); }
 function saveConversations() { localStorage.setItem(CONVERSATIONS_KEY, JSON.stringify(state.conversations)); localStorage.setItem(ACTIVE_CONVERSATION_KEY, state.activeConversationId || ''); }
-function renderConversationList() { $('#conversation-list').innerHTML=state.conversations.map(item=>`<div class="conversation-item ${item.id===state.activeConversationId?'active':''}" data-conversation-id="${item.id}"><button class="conversation-select" type="button"><span class="conversation-title">${escapeHtml(item.title)}</span><small class="conversation-meta">${item.messages.length} 条消息 · ${item.datasetId?'已选数据表':'未选数据表'}</small></button><span class="conversation-actions"><button type="button" data-action="rename" title="重命名">重命名</button><button type="button" data-action="delete" class="${state.pendingDeleteId===item.id?'confirm-delete':''}" title="删除">${state.pendingDeleteId===item.id?'确认删除':'删除'}</button></span></div>`).join(''); }
+function renderConversationList() { $('#conversation-list').innerHTML=state.conversations.map(item=>`<div class="conversation-item ${item.id===state.activeConversationId?'active':''}" data-conversation-id="${item.id}"><button class="conversation-select" type="button"><span class="conversation-title">${escapeHtml(item.title)}</span><small class="conversation-meta">${item.messages.length} 条消息 · ${item.datasetId?'手动选择':'自动选表'}</small></button><span class="conversation-actions"><button type="button" data-action="rename" title="重命名">重命名</button><button type="button" data-action="delete" class="${state.pendingDeleteId===item.id?'confirm-delete':''}" title="删除">${state.pendingDeleteId===item.id?'确认删除':'删除'}</button></span></div>`).join(''); }
 function welcomeHtml() { return '<div class="welcome"><div class="orb">✦</div><h2>想从数据里了解什么？</h2><p>我会检索相关业务术语，生成并执行 SQL，然后用自然语言告诉你结果。</p><div class="examples"><button>这张表一共有多少条数据？</button><button>按类别统计数量，找出最多的三类</button><button>最近一个月的数据趋势如何？</button></div></div>'; }
 function renderMessages() { const item=activeConversation();$('#messages').innerHTML=item?.messages.length?'':welcomeHtml();item?.messages.forEach(message=>addMessage(message.role,message.content,message.details,false)); }
-function switchConversation(id) { if(!state.conversations.some(item=>item.id===id))return;state.activeConversationId=id;const item=activeConversation();$('#chat-dataset').value=state.datasets.some(d=>d.id===item.datasetId)?item.datasetId:(state.datasets[0]?.id||'');if(!item.datasetId)item.datasetId=$('#chat-dataset').value;renderConversationList();renderMessages();saveConversations();showView('chat'); }
-function addConversation() { const item=createConversation();item.datasetId=$('#chat-dataset').value||state.datasets[0]?.id||'';state.conversations.unshift(item);state.activeConversationId=item.id;saveConversations();renderConversationList();renderMessages();showView('chat');$('#question').focus(); }
+function switchConversation(id) { if(!state.conversations.some(item=>item.id===id))return;state.activeConversationId=id;const item=activeConversation();$('#chat-dataset').value=state.datasets.some(d=>d.id===item.datasetId)?item.datasetId:'';if(item.datasetId&&!state.datasets.some(d=>d.id===item.datasetId))item.datasetId='';renderConversationList();renderMessages();saveConversations();showView('chat'); }
+function addConversation() { const item=createConversation();item.datasetId=$('#chat-dataset').value||'';state.conversations.unshift(item);state.activeConversationId=item.id;saveConversations();renderConversationList();renderMessages();showView('chat');$('#question').focus(); }
 
 $('#new-conversation').onclick=addConversation;
 $('#conversation-list').onclick=e=>{const row=e.target.closest('[data-conversation-id]');if(!row)return;const id=row.dataset.conversationId,action=e.target.closest('[data-action]')?.dataset.action;if(action==='rename'){state.pendingDeleteId=null;const title=row.querySelector('.conversation-title');title.contentEditable='true';title.classList.add('editing');title.focus();document.getSelection()?.selectAllChildren(title);return}if(action==='delete'){if(state.conversations.length===1){toast('至少保留一个对话');return}if(state.pendingDeleteId!==id){state.pendingDeleteId=id;renderConversationList();toast('请再次点击“确认删除”');return}state.pendingDeleteId=null;state.conversations=state.conversations.filter(x=>x.id!==id);if(state.activeConversationId===id)state.activeConversationId=state.conversations[0].id;saveConversations();switchConversation(state.activeConversationId);toast('对话已删除');return}state.pendingDeleteId=null;switchConversation(id)};
@@ -53,7 +53,7 @@ $$('.nav').forEach(x => x.onclick = () => showView(x.dataset.view));
 $$('[data-jump]').forEach(x => x.onclick = () => showView(x.dataset.jump));
 
 function datasetOptions(includeAll = false) {
-  const head = includeAll ? '<option value="">全部数据表</option>' : '<option value="">请选择数据表</option>';
+  const head = includeAll ? '<option value="">全部数据表</option>' : '<option value="">自动选择数据表</option>';
   return head + state.datasets.map(d => `<option value="${d.id}">${escapeHtml(d.name)}</option>`).join('');
 }
 
@@ -61,8 +61,8 @@ async function loadDatasets() {
   state.datasets = await api('/api/datasets');
   const chatValue = $('#chat-dataset').value;
   $('#chat-dataset').innerHTML = datasetOptions();
-  $('#chat-dataset').value = state.datasets.some(d => d.id === chatValue) ? chatValue : (state.datasets[0]?.id || '');
-  const conversation=activeConversation();if(conversation){$('#chat-dataset').value=state.datasets.some(d=>d.id===conversation.datasetId)?conversation.datasetId:(state.datasets[0]?.id||'');conversation.datasetId=$('#chat-dataset').value;saveConversations()}
+  $('#chat-dataset').value = state.datasets.some(d => d.id === chatValue) ? chatValue : '';
+  const conversation=activeConversation();if(conversation){$('#chat-dataset').value=state.datasets.some(d=>d.id===conversation.datasetId)?conversation.datasetId:'';if(conversation.datasetId&&!state.datasets.some(d=>d.id===conversation.datasetId))conversation.datasetId='';saveConversations()}
   $('#term-dataset-filter').innerHTML = datasetOptions(true);
   $('[name="dataset_id"]', $('#term-form')).innerHTML = '<option value="">全局术语</option>' + state.datasets.map(d => `<option value="${d.id}">${escapeHtml(d.name)}</option>`).join('');
   $('#dataset-list').innerHTML = state.datasets.length ? state.datasets.map(d => `
@@ -74,6 +74,7 @@ $('#chat-dataset').onchange=()=>{const item=activeConversation();if(item){item.d
 
 $('#upload-open').onclick = () => $('#upload-dialog').showModal();
 $('#term-open').onclick = () => $('#term-dialog').showModal();
+$('#term-import-open').onclick = () => $('#term-import-dialog').showModal();
 $$('[data-close]').forEach(x => x.onclick = () => x.closest('dialog').close());
 
 $('#upload-form').onsubmit = async e => {
@@ -101,6 +102,11 @@ $('#term-dataset-filter').onchange = loadTerms;
 $('#term-form').onsubmit = async e => {
   e.preventDefault(); const data = Object.fromEntries(new FormData(e.target)); data.dataset_id ||= null;
   try { await api('/api/terms', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}); e.target.reset(); $('#term-dialog').close(); await loadTerms(); toast('术语已保存'); } catch(err) { toast(err.message); }
+};
+$('#term-import-form').onsubmit = async e => {
+  e.preventDefault(); const button = $('button.primary', e.target); button.disabled = true; button.textContent = '导入中…';
+  try { const result = await api('/api/terms/import', {method:'POST', body:new FormData(e.target)}); e.target.reset(); $('#term-import-dialog').close(); await loadTerms(); toast(`成功导入 ${result.imported} 条，跳过 ${result.skipped} 条重复术语`); }
+  catch(err) { toast(err.message); } finally { button.disabled = false; button.textContent = '开始导入'; }
 };
 $('#term-list').onclick = async e => { const id=e.target.dataset.deleteTerm;if(!id)return;try{await api(`/api/terms/${id}`,{method:'DELETE'});await loadTerms();toast('术语已删除')}catch(err){toast(err.message)}};
 
@@ -135,7 +141,7 @@ function formatDuration(ms){if(ms==null)return'--';return ms<1000?`${ms} ms`:`${
 function formatTokens(value){return value==null?'-- Token':`${Number(value).toLocaleString()} Token`}
 $('#messages').onclick=e=>{const button=e.target.closest('.examples button');if(button){$('#question').value=button.textContent;$('#question').focus()}};
 $('#ask-form').onsubmit = async e => {
-  e.preventDefault();const question=$('#question').value.trim(),dataset_id=$('#chat-dataset').value;if(!question)return;if(!dataset_id){toast('请先上传并选择数据表');showView('datasets');return}if(!state.model){toast('请先配置模型 API');showView('settings');return}
+  e.preventDefault();const question=$('#question').value.trim(),dataset_id=$('#chat-dataset').value||null;if(!question)return;if(!state.datasets.length){toast('请先上传数据表');showView('datasets');return}if(!state.model){toast('请先配置模型 API');showView('settings');return}
   const conversationId=state.activeConversationId;addMessage('user',question);$('#question').value='';const loading=addMessage('assistant','正在检索术语、生成 SQL 并查询数据…',null,false);$('.send').disabled=true;
   const finish=(content,details=null)=>{loading.remove();const item=state.conversations.find(x=>x.id===conversationId);if(!item)return;if(state.activeConversationId===conversationId)addMessage('assistant',content,details);else{item.messages.push({role:'assistant',content,details});item.updatedAt=Date.now();saveConversations();renderConversationList()}};
   try{const result=await api('/api/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset_id,question,model:state.model})});finish(result.answer,result)}catch(err){finish(`问数失败：${err.message}`)}finally{$('.send').disabled=false}
