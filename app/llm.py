@@ -3,12 +3,17 @@ from __future__ import annotations
 import json
 import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Any
 
 import httpx
 
 from .answer import answer_generation_prompt
+
+SQL_CACHE_MAX = 128
+_SQL_CACHE: OrderedDict[str, tuple[str, str, str]] = OrderedDict()
 
 
 @dataclass
@@ -36,6 +41,7 @@ class ChatResult:
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     total_tokens: int | None = None
+    cached: bool = False
 
 
 def _chat_url(base_url: str) -> str:
@@ -44,9 +50,16 @@ def _chat_url(base_url: str) -> str:
     return f"{base_url}/chat/completions"
 
 
-async def chat(config: ModelConfig, messages: list[dict[str, str]], temperature: float = 0) -> ChatResult:
+async def chat(
+    config: ModelConfig,
+    messages: list[dict[str, str]],
+    temperature: float = 0,
+    max_tokens: int | None = None,
+) -> ChatResult:
     headers = {"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"}
     payload = {"model": config.model, "messages": messages, "temperature": temperature}
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
     started_at = time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=90) as client:
@@ -138,6 +151,86 @@ def extract_reasoning_summary(text: str, sql: str) -> str:
     return "模型返回了可执行 SQL；该 SQL 将" + "、".join(actions) + "。"
 
 
+def _column_names(columns: list[dict[str, str]]) -> set[str]:
+    return {str(col.get("name", "")).strip() for col in columns if str(col.get("name", "")).strip()}
+
+
+def _canonical_sql_rules(route_info: dict[str, Any] | None, columns: list[dict[str, str]], table_name: str) -> str:
+    names = _column_names(columns)
+    route = route_info or {}
+    intent_type = str(route.get("intent_type", "generic_sql_query"))
+    time_fields = [field for field in route.get("time_fields", []) if field in names]
+    rules = [
+        "同一 intent_type 的同类问题必须使用稳定 SQL 形态：除日期、数值、名称等用户条件外，不要随意更换 SELECT、聚合函数、GROUP BY、ORDER BY、LIMIT 的写法。",
+        "问事件数、记录数、次数时统一使用 COUNT(*)；只有用户明确问船舶数、去重船舶数、多少船时才使用去重统计。",
+    ]
+    if "target_id" in names:
+        rules.append('问船舶数时统一使用 COUNT(DISTINCT "target_id")，不要改用 COUNT(*)。')
+    elif "mmsi" in names:
+        rules.append('问船舶数时统一使用 COUNT(DISTINCT "mmsi")，不要改用 COUNT(*)。')
+    if time_fields:
+        primary_time = time_fields[0]
+        rules.append(f'时间筛选优先使用 "{primary_time}"。用户说“今天/当前/最新”且未给具体日期时，统一使用该字段在当前表内的最大日期/最新记录口径。')
+        rules.append(f'“今天/今日”这类问题优先写成 date("{primary_time}") = (SELECT MAX(date("{primary_time}")) FROM "{table_name}")。')
+    if intent_type == "gate_crossing_stat":
+        if {"event_name_code", "event_type_code"}.issubset(names):
+            rules.append('VTS 进入统计固定筛选 "event_name_code" = \'VTS_CROSSING_REPORT_LINE\' AND "event_type_code" = \'CROSSING_IN\'。')
+    elif intent_type == "traffic_section_flow":
+        if "event_type_code" in names:
+            rules.append('截面流量方向固定映射：上行用 "event_type_code" = \'FLOW_UP\'，下行用 "event_type_code" = \'FLOW_DOWN\'。')
+    elif intent_type == "vessel_list_by_condition":
+        if "draught" in names:
+            rules.append('吃水条件固定使用 "draught" 字段。')
+        if "update_time" in names:
+            rules.append('实时快照排序优先使用 "update_time" DESC。')
+    elif intent_type == "violation_event_stat":
+        if "violation_time" in names:
+            rules.append('违规统计固定使用 "violation_time" 作为发生时间字段。')
+    elif intent_type == "risk_event_stat":
+        if "risk_time" in names:
+            rules.append('风险统计固定使用 "risk_time" 作为发生时间字段。')
+        if "risk_type_code" in names:
+            rules.append('当前有效风险优先排除 "risk_type_code" = \'CLOSE\'。')
+    elif intent_type == "vessel_status_count":
+        if {"event_name_code", "event_type_code"}.issubset(names):
+            rules.append('当前状态统计固定筛选 "event_type_code" = \'OPEN\'；航行/锚泊/靠泊分别使用 NAVIGATION/ANCHOR/BERTHING。')
+    elif intent_type == "anchorage_anchor_stat":
+        if {"event_name_code", "event_type_code", "region_uuid"}.issubset(names):
+            rules.append('锚地锚泊统计固定筛选 "event_name_code" = \'ANCHOR\' AND "event_type_code" = \'OPEN\'，并按 "region_uuid" 分组。')
+    return "\n".join(f"{index + 1}. {rule}" for index, rule in enumerate(rules))
+
+
+def _sql_cache_key(
+    config: ModelConfig,
+    question: str,
+    table_name: str,
+    columns: list[dict[str, str]],
+    terms: list[dict[str, Any]],
+    route_info: dict[str, Any] | None,
+) -> str:
+    route = {key: value for key, value in (route_info or {}).items() if key != "candidates"}
+    term_digest = [
+        {
+            "term": item.get("term"),
+            "definition": item.get("definition"),
+            "synonyms": item.get("synonyms", ""),
+            "dataset_id": item.get("dataset_id"),
+        }
+        for item in terms
+    ]
+    payload = {
+        "model": config.model,
+        "base_url": config.base_url,
+        "question": question.strip(),
+        "table_name": table_name,
+        "columns": columns,
+        "terms": term_digest,
+        "route_info": route,
+    }
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return sha256(text.encode("utf-8")).hexdigest()
+
+
 async def generate_sql(
     config: ModelConfig,
     question: str,
@@ -146,12 +239,19 @@ async def generate_sql(
     terms: list[dict[str, Any]],
     route_info: dict[str, Any] | None = None,
 ) -> tuple[str, str, ChatResult]:
+    cache_key = _sql_cache_key(config, question, table_name, columns, terms, route_info)
+    if cache_key in _SQL_CACHE:
+        sql, reasoning_summary, content = _SQL_CACHE.pop(cache_key)
+        _SQL_CACHE[cache_key] = (sql, reasoning_summary, content)
+        return sql, reasoning_summary, ChatResult(content=content, elapsed_ms=0, cached=True)
+
     schema = "\n".join(f'- "{col["name"]}" ({col["type"]})' for col in columns)
     glossary = "\n".join(
         f'- {item["term"]}（同义词：{item["synonyms"] or "无"}）：{item["definition"]}' for item in terms
     ) or "无相关业务术语"
     prompt_route_info = {key: value for key, value in (route_info or {}).items() if key != "candidates"}
     intent_context = json.dumps(prompt_route_info, ensure_ascii=False, default=str, indent=2)
+    canonical_rules = _canonical_sql_rules(route_info, columns, table_name)
     prompt = f"""你是 SQLite 数据分析专家。请把问题转换成一条可执行的只读 SQL。
 
 系统已识别出的意图与数据表：
@@ -164,6 +264,9 @@ async def generate_sql(
 业务术语：
 {glossary}
 
+稳定 SQL 写法：
+{canonical_rules}
+
 用户问题：{question}
 
 规则：
@@ -175,10 +278,19 @@ async def generate_sql(
 6. 返回 JSON，格式必须是：{{"reasoning_summary":"简要说明使用的字段、筛选、聚合、分组和排序逻辑","sql":"可执行 SQL"}}。
 7. reasoning_summary 只提供简洁、可核验的 SQL 生成依据，不输出隐藏推理或冗长思维链。
 8. 不要输出 Markdown 或 JSON 之外的内容。
+9. 不要为了同类问题创造新的等价 SQL 写法，优先复用上面的稳定 SQL 写法。
 """
     result = await chat(
         config,
-        [{"role": "system", "content": "你只负责生成安全、准确的 SQLite SQL。"}, {"role": "user", "content": prompt}],
+        [
+            {
+                "role": "system",
+                "content": "你只负责生成安全、准确、稳定的 SQLite SQL。temperature 已设为 0，同类问题必须保持一致写法。",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0,
+        max_tokens=500,
     )
     parsed = extract_response_json(result.content)
     if parsed is not None:
@@ -186,6 +298,16 @@ async def generate_sql(
     else:
         sql = extract_sql(result.content)
     reasoning_summary = extract_reasoning_summary(result.content, sql)
+    try:
+        from .query import validate_sql
+
+        validate_sql(sql, table_name)
+    except ValueError:
+        pass
+    else:
+        _SQL_CACHE[cache_key] = (sql, reasoning_summary, result.content)
+        if len(_SQL_CACHE) > SQL_CACHE_MAX:
+            _SQL_CACHE.popitem(last=False)
     return sql, reasoning_summary, result
 
 
