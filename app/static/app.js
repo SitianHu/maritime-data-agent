@@ -127,15 +127,37 @@ function updateModelStatus(){const el=$('.status');el.classList.toggle('ready',!
 $('#model-form').onsubmit = e => { e.preventDefault();saveModel();toast('模型配置已保存到当前会话');showView('chat'); };
 $('#test-model').onclick = async () => { const el=$('#model-result');el.textContent='正在测试连接…';try{const result=await api('/api/model/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(readModel())});el.textContent=`✓ ${result.message}`;}catch(err){el.textContent=`连接失败：${err.message}`;} };
 
+function splitAnswerSections(content) {
+  const names = ['直接结论', '统计范围', '结果明细', '统计口径', '可追溯信息', '注意事项'];
+  const pattern = new RegExp(`(?:^|\\n)(${names.join('|')})[:：]\\s*\\n?`, 'g');
+  const sections = {}; let match, last = null, lastIndex = 0;
+  while ((match = pattern.exec(content)) !== null) {
+    if (last) sections[last] = content.slice(lastIndex, match.index).trim();
+    last = match[1]; lastIndex = pattern.lastIndex;
+  }
+  if (last) sections[last] = content.slice(lastIndex).trim();
+  return sections;
+}
+function renderSection(title, body) { return body ? `<section class="answer-section"><b>${escapeHtml(title)}</b><div class="answer-section-body">${escapeHtml(body)}</div></section>` : ''; }
+function renderAnswerContent(content, details) {
+  if (!details) return escapeHtml(content);
+  const sections = splitAnswerSections(content);
+  if (!sections['直接结论'] && !sections['结果明细']) return escapeHtml(content);
+  const visible = `${renderSection('直接结论', sections['直接结论'])}${renderSection('结果明细', sections['结果明细'])}`;
+  const folded = `${renderSection('统计范围', sections['统计范围'])}${renderSection('统计口径', sections['统计口径'])}${renderSection('可追溯信息', sections['可追溯信息'])}${renderSection('注意事项', sections['注意事项'])}`;
+  return `<div class="answer-main">${visible || escapeHtml(content)}</div>${folded ? `<details class="answer-more"><summary>查看统计范围、统计口径和可追溯信息</summary>${folded}</details>` : ''}`;
+}
 function addMessage(role, content, details, persist = true) {
   $('.welcome')?.remove(); const wrap=document.createElement('div');wrap.className=`message ${role}`;
   let extra=''; if(details){
     const heads=details.columns.map(x=>`<th>${escapeHtml(x)}</th>`).join('');
     const rows=details.rows.slice(0,30).map(r=>`<tr>${details.columns.map(c=>`<td>${escapeHtml(r[c])}</td>`).join('')}</tr>`).join('');
     const metrics=details.metrics||{},tokens=metrics.total_tokens==null?'模型未返回':metrics.total_tokens.toLocaleString();
-    extra=`<div class="run-stats"><span>总耗时 <b>${formatDuration(metrics.total_elapsed_ms)}</b></span><span>Token <b>${tokens}</b></span></div><details class="meta-panel"><summary>查看 SQL 生成过程、SQL 和查询结果</summary><section class="reasoning-summary"><b>SQL 生成依据</b><p>${escapeHtml(details.reasoning_summary||'暂无生成依据记录')}</p></section><div class="metric-grid"><span>SQL 生成<strong>${formatDuration(metrics.sql_generation_elapsed_ms)} · ${formatTokens(metrics.sql_generation_tokens)}</strong></span><span>数据库查询<strong>${formatDuration(metrics.query_elapsed_ms)}</strong></span><span>答案生成<strong>${formatDuration(metrics.answer_generation_elapsed_ms)} · ${formatTokens(metrics.answer_generation_tokens)}</strong></span><span>Token 明细<strong>输入 ${formatTokens(metrics.prompt_tokens)} / 输出 ${formatTokens(metrics.completion_tokens)}</strong></span></div><pre>${escapeHtml(details.sql)}</pre>${rows?`<div class="result-table"><table><thead><tr>${heads}</tr></thead><tbody>${rows}</tbody></table></div>`:'<p>查询结果为空</p>'}</details>`;
+    const sqlTime = metrics.sql_generation_cached ? '缓存命中' : formatDuration(metrics.sql_generation_elapsed_ms);
+    extra=`<div class="run-stats"><span>总耗时 <b>${formatDuration(metrics.total_elapsed_ms)}</b></span><span>Token <b>${tokens}</b></span>${metrics.sql_generation_cached?'<span>SQL <b>缓存命中</b></span>':''}</div><details class="meta-panel"><summary>查看 SQL 生成过程、SQL 和查询结果</summary><section class="reasoning-summary"><b>SQL 生成依据</b><p>${escapeHtml(details.reasoning_summary||'暂无生成依据记录')}</p></section><div class="metric-grid"><span>SQL 生成<strong>${sqlTime} · ${formatTokens(metrics.sql_generation_tokens)}</strong></span><span>数据库查询<strong>${formatDuration(metrics.query_elapsed_ms)}</strong></span><span>答案生成<strong>${formatDuration(metrics.answer_generation_elapsed_ms)} · ${formatTokens(metrics.answer_generation_tokens)}</strong></span><span>Token 明细<strong>输入 ${formatTokens(metrics.prompt_tokens)} / 输出 ${formatTokens(metrics.completion_tokens)}</strong></span></div><pre>${escapeHtml(details.sql)}</pre>${rows?`<div class="result-table"><table><thead><tr>${heads}</tr></thead><tbody>${rows}</tbody></table></div>`:'<p>查询结果为空</p>'}</details>`;
   }
-  wrap.innerHTML=`<div class="bubble">${escapeHtml(content)}${extra}</div>`;$('#messages').append(wrap);$('#messages').scrollTop=$('#messages').scrollHeight;if(persist){const item=activeConversation();if(item){item.messages.push({role,content,details:details||null});item.updatedAt=Date.now();if(item.title==='新对话'&&role==='user')item.title=content.slice(0,18);saveConversations();renderConversationList()}}return wrap;
+  const renderedContent = role === 'assistant' ? renderAnswerContent(content, details) : escapeHtml(content);
+  wrap.innerHTML=`<div class="bubble">${renderedContent}${extra}</div>`;$('#messages').append(wrap);$('#messages').scrollTop=$('#messages').scrollHeight;if(persist){const item=activeConversation();if(item){item.messages.push({role,content,details:details||null});item.updatedAt=Date.now();if(item.title==='新对话'&&role==='user')item.title=content.slice(0,18);saveConversations();renderConversationList()}}return wrap;
 }
 function formatDuration(ms){if(ms==null)return'--';return ms<1000?`${ms} ms`:`${(ms/1000).toFixed(2)} s`}
 function formatTokens(value){return value==null?'-- Token':`${Number(value).toLocaleString()} Token`}
