@@ -1,12 +1,13 @@
 const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => [...root.querySelectorAll(s)];
-const state = { datasets: [], terms: [], model: null, conversations: [], activeConversationId: null, pendingDeleteId: null };
+const state = { datasets: [], terms: [], model: null, conversations: [], activeConversationId: null, pendingDeleteId: null, editingTermId: null };
 const CONVERSATIONS_KEY = 'smart-query-conversations';
 const ACTIVE_CONVERSATION_KEY = 'smart-query-active-conversation';
 const titles = {
   chat: ['问数助手', '选择数据表，用自然语言获得答案'],
   datasets: ['数据表', '管理已上传的数据文件'],
   terms: ['术语库', '统一业务概念和计算口径'],
+  codes: ['业务数值映射', '维护枚举编码、业务名称、同义词和字段绑定'],
   settings: ['模型设置', '选择你自己的模型 API'],
 };
 
@@ -47,6 +48,7 @@ function showView(name) {
   $$('.view').forEach(x => x.classList.toggle('active', x.id === `view-${name}`));
   $('#page-title').textContent = titles[name][0]; $('#page-subtitle').textContent = titles[name][1];
   if (name === 'terms') loadTerms();
+  if (name === 'codes') window.loadCodeAdmin?.();
 }
 
 $$('.nav').forEach(x => x.onclick = () => showView(x.dataset.view));
@@ -67,13 +69,19 @@ async function loadDatasets() {
   $('[name="dataset_id"]', $('#term-form')).innerHTML = '<option value="">全局术语</option>' + state.datasets.map(d => `<option value="${d.id}">${escapeHtml(d.name)}</option>`).join('');
   $('#dataset-list').innerHTML = state.datasets.length ? state.datasets.map(d => `
     <article class="card"><h3>${escapeHtml(d.name)}</h3><p>${escapeHtml(d.source_file)}</p><small>${d.row_count.toLocaleString()} 行 · ${d.columns.length} 个字段</small>
-    <div class="card-footer"><span>${new Date(d.created_at).toLocaleString()}</span><button class="danger" data-delete-dataset="${d.id}">删除</button></div></article>`).join('') : '<div class="empty">还没有数据表，上传一个 CSV 或 Excel 开始问数。</div>';
+    <div class="card-footer"><span>${new Date(d.created_at).toLocaleString()}</span><div><button class="ghost" data-preview-dataset="${d.id}">查看</button> <button class="danger" data-delete-dataset="${d.id}">删除</button></div></div></article>`).join('') : '<div class="empty">还没有数据表，上传一个 CSV 或 Excel 开始问数。</div>';
 }
 
 $('#chat-dataset').onchange=()=>{const item=activeConversation();if(item){item.datasetId=$('#chat-dataset').value;item.updatedAt=Date.now();saveConversations()}};
 
 $('#upload-open').onclick = () => $('#upload-dialog').showModal();
-$('#term-open').onclick = () => $('#term-dialog').showModal();
+$('#term-open').onclick = () => {
+  state.editingTermId = null;
+  $('#term-form').reset();
+  $('.modal-head h3', $('#term-form')).textContent = '新增业务术语';
+  $('button.primary', $('#term-form')).textContent = '保存术语';
+  $('#term-dialog').showModal();
+};
 $('#term-import-open').onclick = () => $('#term-import-dialog').showModal();
 $$('[data-close]').forEach(x => x.onclick = () => x.closest('dialog').close());
 
@@ -84,6 +92,27 @@ $('#upload-form').onsubmit = async e => {
 };
 
 $('#dataset-list').onclick = async e => {
+  const previewId = e.target.dataset.previewDataset;
+  if (previewId) {
+    const dataset = state.datasets.find(item => item.id === previewId);
+    $('#dataset-preview-title').textContent = dataset ? `查看数据表：${dataset.name}` : '查看数据表';
+    $('#dataset-preview-meta').textContent = '正在加载数据…';
+    $('#dataset-preview-content').innerHTML = '';
+    $('#dataset-preview-dialog').showModal();
+    try {
+      const preview = await api(`/api/datasets/${previewId}/preview?limit=100`);
+      $('#dataset-preview-meta').textContent = `共 ${preview.dataset.row_count.toLocaleString()} 行 · 当前显示前 ${preview.rows.length} 行`;
+      const heads = preview.columns.map(column => `<th>${escapeHtml(column)}</th>`).join('');
+      const rows = preview.rows.map(row => `<tr>${preview.columns.map(column => `<td>${escapeHtml(row[column])}</td>`).join('')}</tr>`).join('');
+      $('#dataset-preview-content').innerHTML = preview.rows.length
+        ? `<table><thead><tr>${heads}</tr></thead><tbody>${rows}</tbody></table>`
+        : '<div class="empty">这张数据表没有数据。</div>';
+    } catch (err) {
+      $('#dataset-preview-meta').textContent = '';
+      $('#dataset-preview-content').innerHTML = `<div class="empty">${escapeHtml(err.message)}</div>`;
+    }
+    return;
+  }
   const id = e.target.dataset.deleteDataset; if (!id || !confirm('确定删除这个数据表及其关联术语吗？')) return;
   try { await api(`/api/datasets/${id}`, {method:'DELETE'}); await loadDatasets(); toast('数据表已删除'); } catch(err) { toast(err.message); }
 };
@@ -93,7 +122,7 @@ async function loadTerms() {
   state.terms = await api(`/api/terms?dataset_id=${encodeURIComponent(dataset)}&q=${encodeURIComponent(q)}`);
   $('#term-list').innerHTML = state.terms.length ? state.terms.map(t => {
     const ds = state.datasets.find(d => d.id === t.dataset_id);
-    return `<div class="term"><b>${escapeHtml(t.term)}<small>${escapeHtml(t.synonyms || '无同义词')}</small></b><span>${escapeHtml(t.definition)}</span><div><small>${escapeHtml(ds?.name || '全局')}</small> <button class="danger" data-delete-term="${t.id}">删除</button></div></div>`;
+    return `<div class="term"><b>${escapeHtml(t.term)}<small>${escapeHtml(t.synonyms || '无同义词')}</small></b><span>${escapeHtml(t.definition)}</span><div><small>${escapeHtml(ds?.name || '全局')}</small> <button class="ghost" style="padding:5px 6px;border-radius:6px" data-edit-term="${t.id}">编辑</button> <button class="danger" data-delete-term="${t.id}">删除</button></div></div>`;
   }).join('') : '<div class="empty">没有匹配的术语。</div>';
 }
 
@@ -101,14 +130,33 @@ let searchTimer; $('#term-search').oninput = () => { clearTimeout(searchTimer); 
 $('#term-dataset-filter').onchange = loadTerms;
 $('#term-form').onsubmit = async e => {
   e.preventDefault(); const data = Object.fromEntries(new FormData(e.target)); data.dataset_id ||= null;
-  try { await api('/api/terms', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}); e.target.reset(); $('#term-dialog').close(); await loadTerms(); toast('术语已保存'); } catch(err) { toast(err.message); }
+  const id = state.editingTermId;
+  const url = id ? `/api/terms/${id}` : '/api/terms';
+  try { await api(url, {method:id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}); e.target.reset(); state.editingTermId = null; $('#term-dialog').close(); await loadTerms(); toast(id ? '术语已更新' : '术语已保存'); } catch(err) { toast(err.message); }
 };
 $('#term-import-form').onsubmit = async e => {
   e.preventDefault(); const button = $('button.primary', e.target); button.disabled = true; button.textContent = '导入中…';
   try { const result = await api('/api/terms/import', {method:'POST', body:new FormData(e.target)}); e.target.reset(); $('#term-import-dialog').close(); await loadTerms(); toast(`成功导入 ${result.imported} 条，跳过 ${result.skipped} 条重复术语`); }
   catch(err) { toast(err.message); } finally { button.disabled = false; button.textContent = '开始导入'; }
 };
-$('#term-list').onclick = async e => { const id=e.target.dataset.deleteTerm;if(!id)return;try{await api(`/api/terms/${id}`,{method:'DELETE'});await loadTerms();toast('术语已删除')}catch(err){toast(err.message)}};
+$('#term-list').onclick = async e => {
+  const editId = e.target.dataset.editTerm;
+  if (editId) {
+    const term = state.terms.find(item => item.id === editId);
+    if (!term) return;
+    state.editingTermId = editId;
+    const form = $('#term-form');
+    form.elements.term.value = term.term;
+    form.elements.definition.value = term.definition;
+    form.elements.synonyms.value = term.synonyms || '';
+    form.elements.dataset_id.value = term.dataset_id || '';
+    $('.modal-head h3', form).textContent = '编辑业务术语';
+    $('button.primary', form).textContent = '保存修改';
+    $('#term-dialog').showModal();
+    return;
+  }
+  const id=e.target.dataset.deleteTerm;if(!id)return;try{await api(`/api/terms/${id}`,{method:'DELETE'});await loadTerms();toast('术语已删除')}catch(err){toast(err.message)}
+};
 
 const providers = {
   openai: {base_url:'https://api.openai.com/v1', model:'gpt-4.1-mini'},
@@ -154,7 +202,10 @@ function addMessage(role, content, details, persist = true) {
     const rows=details.rows.slice(0,30).map(r=>`<tr>${details.columns.map(c=>`<td>${escapeHtml(r[c])}</td>`).join('')}</tr>`).join('');
     const metrics=details.metrics||{},tokens=metrics.total_tokens==null?'模型未返回':metrics.total_tokens.toLocaleString();
     const sqlTime = metrics.sql_generation_cached ? '缓存命中' : formatDuration(metrics.sql_generation_elapsed_ms);
-    extra=`<div class="run-stats"><span>总耗时 <b>${formatDuration(metrics.total_elapsed_ms)}</b></span><span>Token <b>${tokens}</b></span>${metrics.sql_generation_cached?'<span>SQL <b>缓存命中</b></span>':''}</div><details class="meta-panel"><summary>查看 SQL 生成过程、SQL 和查询结果</summary><section class="reasoning-summary"><b>SQL 生成依据</b><p>${escapeHtml(details.reasoning_summary||'暂无生成依据记录')}</p></section><div class="metric-grid"><span>SQL 生成<strong>${sqlTime} · ${formatTokens(metrics.sql_generation_tokens)}</strong></span><span>数据库查询<strong>${formatDuration(metrics.query_elapsed_ms)}</strong></span><span>答案生成<strong>${formatDuration(metrics.answer_generation_elapsed_ms)} · ${formatTokens(metrics.answer_generation_tokens)}</strong></span><span>Token 明细<strong>输入 ${formatTokens(metrics.prompt_tokens)} / 输出 ${formatTokens(metrics.completion_tokens)}</strong></span></div><pre>${escapeHtml(details.sql)}</pre>${rows?`<div class="result-table"><table><thead><tr>${heads}</tr></thead><tbody>${rows}</tbody></table></div>`:'<p>查询结果为空</p>'}</details>`;
+    const codeRequests=details.route?.code_lookup_requests||[],codeVersion=details.route?.code_dictionary_version;
+    const codeBadge=codeRequests.length?`<span>编码映射 <b>v${escapeHtml(codeVersion||'--')} · ${codeRequests.length} 个字段</b></span>`:'';
+    const codeDetails=codeRequests.length?`<section class="reasoning-summary"><b>字段编码映射</b>${codeRequests.map(x=>`<p>${escapeHtml(x.table)}.${escapeHtml(x.column)} · ${escapeHtml(x.code_type)} · ${escapeHtml(x.purpose)}${x.mention?` · “${escapeHtml(x.mention)}” → ${escapeHtml((x.code_values||[]).join(', '))}`:''}</p>`).join('')}</section>`:'';
+    extra=`<div class="run-stats"><span>总耗时 <b>${formatDuration(metrics.total_elapsed_ms)}</b></span><span>Token <b>${tokens}</b></span>${codeBadge}${metrics.sql_generation_cached?'<span>SQL <b>缓存命中</b></span>':''}</div><details class="meta-panel"><summary>查看 SQL 生成过程、SQL 和查询结果</summary><section class="reasoning-summary"><b>SQL 生成依据</b><p>${escapeHtml(details.reasoning_summary||'暂无生成依据记录')}</p></section>${codeDetails}<div class="metric-grid"><span>SQL 生成<strong>${sqlTime} · ${formatTokens(metrics.sql_generation_tokens)}</strong></span><span>数据库查询<strong>${formatDuration(metrics.query_elapsed_ms)}</strong></span><span>答案生成<strong>${formatDuration(metrics.answer_generation_elapsed_ms)} · ${formatTokens(metrics.answer_generation_tokens)}</strong></span><span>Token 明细<strong>输入 ${formatTokens(metrics.prompt_tokens)} / 输出 ${formatTokens(metrics.completion_tokens)}</strong></span></div><pre>${escapeHtml(details.sql)}</pre>${rows?`<div class="result-table"><table><thead><tr>${heads}</tr></thead><tbody>${rows}</tbody></table></div>`:'<p>查询结果为空</p>'}</details>`;
   }
   const renderedContent = role === 'assistant' ? renderAnswerContent(content, details) : escapeHtml(content);
   wrap.innerHTML=`<div class="bubble">${renderedContent}${extra}</div>`;$('#messages').append(wrap);$('#messages').scrollTop=$('#messages').scrollHeight;if(persist){const item=activeConversation();if(item){item.messages.push({role,content,details:details||null});item.updatedAt=Date.now();if(item.title==='新对话'&&role==='user')item.title=content.slice(0,18);saveConversations();renderConversationList()}}return wrap;
@@ -174,4 +225,4 @@ if(!Array.isArray(state.conversations)||!state.conversations.length)state.conver
 state.activeConversationId=localStorage.getItem(ACTIVE_CONVERSATION_KEY)||sessionStorage.getItem(ACTIVE_CONVERSATION_KEY);if(!state.conversations.some(x=>x.id===state.activeConversationId))state.activeConversationId=state.conversations[0].id;saveConversations();
 try { state.model=JSON.parse(sessionStorage.getItem('smart-query-model')); } catch {}
 if(state.model){$('#api-key').value=state.model.api_key;$('#base-url').value=state.model.base_url;$('#model-name').value=state.model.model}
-updateModelStatus();renderConversationList();renderMessages();loadDatasets().catch(err=>toast(err.message));
+updateModelStatus();renderConversationList();renderMessages();loadDatasets().then(()=>{const requested=new URLSearchParams(location.search).get('view');if(requested&&titles[requested])showView(requested)}).catch(err=>toast(err.message));

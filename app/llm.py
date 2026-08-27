@@ -207,6 +207,7 @@ def _sql_cache_key(
     columns: list[dict[str, str]],
     terms: list[dict[str, Any]],
     route_info: dict[str, Any] | None,
+    code_context: dict[str, Any] | None = None,
 ) -> str:
     route = {key: value for key, value in (route_info or {}).items() if key != "candidates"}
     term_digest = [
@@ -226,6 +227,7 @@ def _sql_cache_key(
         "columns": columns,
         "terms": term_digest,
         "route_info": route,
+        "code_context": code_context or {},
     }
     text = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     return sha256(text.encode("utf-8")).hexdigest()
@@ -238,8 +240,11 @@ async def generate_sql(
     columns: list[dict[str, str]],
     terms: list[dict[str, Any]],
     route_info: dict[str, Any] | None = None,
+    code_context: dict[str, Any] | None = None,
 ) -> tuple[str, str, ChatResult]:
-    cache_key = _sql_cache_key(config, question, table_name, columns, terms, route_info)
+    from .code_dictionary import prompt_block
+
+    cache_key = _sql_cache_key(config, question, table_name, columns, terms, route_info, code_context)
     if cache_key in _SQL_CACHE:
         sql, reasoning_summary, content = _SQL_CACHE.pop(cache_key)
         _SQL_CACHE[cache_key] = (sql, reasoning_summary, content)
@@ -252,6 +257,7 @@ async def generate_sql(
     prompt_route_info = {key: value for key, value in (route_info or {}).items() if key != "candidates"}
     intent_context = json.dumps(prompt_route_info, ensure_ascii=False, default=str, indent=2)
     canonical_rules = _canonical_sql_rules(route_info, columns, table_name)
+    code_mapping_block = prompt_block(code_context or {})
     prompt = f"""你是 SQLite 数据分析专家。请把问题转换成一条可执行的只读 SQL。
 
 系统已识别出的意图与数据表：
@@ -261,8 +267,11 @@ async def generate_sql(
 字段：
 {schema}
 
-业务术语：
+【普通业务术语】
 {glossary}
+
+【字段编码映射】
+{code_mapping_block}
 
 稳定 SQL 写法：
 {canonical_rules}
@@ -279,6 +288,9 @@ async def generate_sql(
 7. reasoning_summary 只提供简洁、可核验的 SQL 生成依据，不输出隐藏推理或冗长思维链。
 8. 不要输出 Markdown 或 JSON 之外的内容。
 9. 不要为了同类问题创造新的等价 SQL 写法，优先复用上面的稳定 SQL 写法。
+10. 编码字段的 WHERE 条件必须使用“字段编码映射”中提供的数据库真实编码，不能直接使用业务名称。
+11. 只能使用“字段编码映射”中提供的映射，禁止猜测不存在的代码。
+12. display 或 group_by 涉及编码字段时，SELECT 中保留该字段的原始字段名，系统将在查询后翻译为业务名称。
 """
     result = await chat(
         config,

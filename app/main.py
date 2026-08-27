@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import db
+from . import code_dictionary, db
 from .answer import build_answer_payload, build_need_clarification_payload, build_trace_record
 from .intent import route_question
 from .llm import ModelConfig, generate_sql, summarize
@@ -26,6 +26,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     db.init_db()
+    code_dictionary.initialize_default_dictionary()
     yield
 
 
@@ -37,6 +38,24 @@ class TermCreate(BaseModel):
     definition: str = Field(min_length=1, max_length=1000)
     synonyms: str = Field(default="", max_length=500)
     dataset_id: str | None = None
+
+
+class CodeEntryUpdate(BaseModel):
+    description: str = Field(min_length=1, max_length=500)
+    synonyms: str = Field(default="", max_length=1000)
+
+
+class CodeEntryCreate(CodeEntryUpdate):
+    code_type: str = Field(min_length=1, max_length=100)
+    code_value: str = Field(min_length=1, max_length=100)
+
+
+class CodeBindingCreate(BaseModel):
+    dataset_id: str
+    table_name: str
+    column_name: str
+    code_type: str
+    enabled: bool = True
 
 
 class AskRequest(BaseModel):
@@ -112,6 +131,7 @@ async def upload_dataset(
             frame.to_sql(table_name, conn, index=False, if_exists="fail")
         columns = [{"name": col, "type": sqlite_type(frame[col])} for col in frame.columns]
         db.save_dataset(dataset_id, display_name, table_name, filename, len(frame), columns)
+        code_dictionary.sync_default_bindings()
     except Exception as exc:
         with db.connection() as conn:
             conn.execute(f'DROP TABLE IF EXISTS "{table_name}"')
@@ -126,6 +146,104 @@ def remove_dataset(dataset_id: str) -> dict[str, bool]:
     return {"ok": True}
 
 
+@app.get("/api/datasets/{dataset_id}/preview")
+def dataset_preview(dataset_id: str, limit: int = Query(default=100, ge=1, le=200)) -> dict[str, Any]:
+    preview = db.preview_dataset(dataset_id, limit)
+    if not preview:
+        raise HTTPException(404, "数据集不存在")
+    return preview
+
+
+@app.get("/api/admin/code-versions")
+def code_versions() -> list[dict[str, Any]]:
+    return code_dictionary.list_versions()
+
+
+@app.post("/api/admin/code-versions/{version_id}/activate")
+def activate_code_version(version_id: str) -> dict[str, Any]:
+    version = code_dictionary.activate_version(version_id)
+    if not version:
+        raise HTTPException(404, "编码字典版本不存在")
+    return version
+
+
+@app.post("/api/admin/code-import")
+async def import_code_dictionary(file: UploadFile = File(...), dry_run: bool = Query(default=False)) -> dict[str, Any]:
+    filename = file.filename or "fm_code.xlsx"
+    if Path(filename).suffix.lower() not in {".xlsx", ".xls"}:
+        raise HTTPException(400, "仅支持 XLSX 和 XLS 文件")
+    content = await file.read()
+    if not content:
+        raise HTTPException(400, "上传的文件为空")
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(400, "编码文件不能超过 10 MB")
+    preview = code_dictionary.parse_workbook(content)
+    if dry_run:
+        return {
+            "valid": not preview["errors"],
+            "entry_count": len(preview["entries"]),
+            "errors": preview["errors"],
+            "duplicates": preview["duplicates"],
+            "preview": preview["entries"][:20],
+        }
+    try:
+        return code_dictionary.import_workbook(content, filename, activate=True)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/admin/code-entries")
+def code_entries(q: str = Query(default="", max_length=100), code_type: str = Query(default="", max_length=100)) -> list[dict[str, Any]]:
+    return code_dictionary.list_entries(q, code_type)
+
+
+@app.post("/api/admin/code-entries")
+def create_code_entry(payload: CodeEntryCreate) -> dict[str, Any]:
+    try:
+        return code_dictionary.create_entry(
+            payload.code_type, payload.code_value, payload.description, payload.synonyms
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.put("/api/admin/code-entries/{entry_id}")
+def edit_code_entry(entry_id: str, payload: CodeEntryUpdate) -> dict[str, Any]:
+    entry = code_dictionary.update_entry(entry_id, payload.description, payload.synonyms)
+    if not entry:
+        raise HTTPException(404, "编码项不存在")
+    return entry
+
+
+@app.delete("/api/admin/code-entries/{entry_id}")
+def remove_code_entry(entry_id: str) -> dict[str, bool]:
+    if not code_dictionary.delete_entry(entry_id):
+        raise HTTPException(404, "编码项不存在")
+    return {"ok": True}
+
+
+@app.get("/api/admin/code-bindings")
+def code_bindings(dataset_id: str = Query(default="", max_length=100)) -> list[dict[str, Any]]:
+    return code_dictionary.list_bindings(dataset_id)
+
+
+@app.post("/api/admin/code-bindings")
+def create_code_binding(payload: CodeBindingCreate) -> dict[str, Any]:
+    try:
+        return code_dictionary.save_binding(
+            payload.dataset_id, payload.table_name, payload.column_name, payload.code_type, payload.enabled
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.delete("/api/admin/code-bindings/{binding_id}")
+def remove_code_binding(binding_id: str) -> dict[str, bool]:
+    if not code_dictionary.delete_binding(binding_id):
+        raise HTTPException(404, "字段绑定不存在")
+    return {"ok": True}
+
+
 @app.get("/api/terms")
 def terms(dataset_id: str | None = None, q: str = Query(default="", max_length=100)) -> list[dict[str, Any]]:
     return db.list_terms(dataset_id, q)
@@ -136,6 +254,16 @@ def create_term(payload: TermCreate) -> dict[str, Any]:
     if payload.dataset_id and not db.get_dataset(payload.dataset_id):
         raise HTTPException(404, "关联的数据集不存在")
     return db.add_term(payload.term, payload.definition, payload.synonyms, payload.dataset_id)
+
+
+@app.put("/api/terms/{term_id}")
+def edit_term(term_id: str, payload: TermCreate) -> dict[str, Any]:
+    if payload.dataset_id and not db.get_dataset(payload.dataset_id):
+        raise HTTPException(404, "关联的数据集不存在")
+    term = db.update_term(term_id, payload.term, payload.definition, payload.synonyms, payload.dataset_id)
+    if not term:
+        raise HTTPException(404, "术语不存在")
+    return term
 
 
 @app.post("/api/terms/import")
@@ -286,6 +414,10 @@ async def ask(payload: AskRequest) -> dict[str, Any]:
     matched_terms = db.list_terms(dataset["id"], payload.question)
     if not matched_terms:
         matched_terms = db.list_terms(dataset["id"])[:30]
+    code_context = code_dictionary.resolve_code_context(payload.question, dataset, route_info)
+    if code_context.get("version"):
+        route_info["code_dictionary_version"] = code_context["version"]["version_number"]
+    route_info["code_lookup_requests"] = code_context.get("requests", [])
     try:
         config = ModelConfig.from_payload(payload.model)
         sql, reasoning_summary, sql_call = await generate_sql(
@@ -295,10 +427,13 @@ async def ask(payload: AskRequest) -> dict[str, Any]:
             dataset["columns"],
             matched_terms,
             route_info,
+            code_context,
         )
         sql = validate_sql(sql, dataset["table_name"])
+        code_dictionary.validate_required_filters(sql, code_context)
         query_started_at = time.perf_counter()
         columns, rows, truncated = execute_readonly(sql)
+        rows, mapping_warnings = code_dictionary.translate_result(columns, rows, code_context)
         execution_time_ms = (time.perf_counter() - query_started_at) * 1000
         query_elapsed_ms = round(execution_time_ms)
         data_update_time = get_data_update_time(dataset["table_name"], [item["name"] for item in dataset["columns"]])
@@ -312,6 +447,7 @@ async def ask(payload: AskRequest) -> dict[str, Any]:
             truncated=truncated,
             execution_time_ms=execution_time_ms,
             data_update_time=data_update_time,
+            warnings=[*code_context.get("warnings", []), *mapping_warnings],
         )
         answer_payload = build_answer_payload(
             route_info=route_info,
@@ -374,6 +510,11 @@ async def ask(payload: AskRequest) -> dict[str, Any]:
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+@app.get("/admin/code-dictionary", include_in_schema=False)
+def code_dictionary_admin() -> FileResponse:
+    return FileResponse(STATIC_DIR / "code_admin.html")
 
 
 @app.get("/{path:path}", include_in_schema=False)

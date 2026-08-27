@@ -53,6 +53,48 @@ def init_db() -> None:
                 FOREIGN KEY(dataset_id) REFERENCES datasets(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_terms_dataset ON terms(dataset_id);
+
+            CREATE TABLE IF NOT EXISTS code_dictionary_versions (
+                id TEXT PRIMARY KEY,
+                version_number INTEGER NOT NULL UNIQUE,
+                source_type TEXT NOT NULL,
+                source_filename TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                imported_at TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1))
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_code_versions_one_enabled
+                ON code_dictionary_versions(enabled) WHERE enabled = 1;
+
+            CREATE TABLE IF NOT EXISTS code_dictionary_entries (
+                id TEXT PRIMARY KEY,
+                version_id TEXT NOT NULL,
+                code_type TEXT NOT NULL,
+                code_value TEXT NOT NULL,
+                description TEXT NOT NULL,
+                synonyms TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(version_id) REFERENCES code_dictionary_versions(id) ON DELETE CASCADE,
+                UNIQUE(version_id, code_type, code_value)
+            );
+            CREATE INDEX IF NOT EXISTS idx_code_entries_lookup
+                ON code_dictionary_entries(version_id, code_type, code_value);
+
+            CREATE TABLE IF NOT EXISTS code_field_bindings (
+                id TEXT PRIMARY KEY,
+                dataset_id TEXT NOT NULL,
+                table_name TEXT NOT NULL,
+                column_name TEXT NOT NULL,
+                code_type TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(dataset_id) REFERENCES datasets(id) ON DELETE CASCADE,
+                UNIQUE(dataset_id, table_name, column_name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_code_bindings_dataset
+                ON code_field_bindings(dataset_id, table_name, enabled);
             """
         )
 
@@ -80,6 +122,23 @@ def get_dataset(dataset_id: str) -> dict[str, Any] | None:
     with connection() as conn:
         row = conn.execute("SELECT * FROM datasets WHERE id = ?", (dataset_id,)).fetchone()
     return serialize_dataset(row) if row else None
+
+
+def preview_dataset(dataset_id: str, limit: int = 100) -> dict[str, Any] | None:
+    dataset = get_dataset(dataset_id)
+    if not dataset:
+        return None
+    safe_limit = max(1, min(limit, 200))
+    table_name = dataset["table_name"].replace('"', '""')
+    with connection() as conn:
+        rows = conn.execute(f'SELECT * FROM "{table_name}" LIMIT ?', (safe_limit,)).fetchall()
+    return {
+        "dataset": dataset,
+        "columns": [column["name"] for column in dataset["columns"]],
+        "rows": [dict(row) for row in rows],
+        "limit": safe_limit,
+        "truncated": dataset["row_count"] > len(rows),
+    }
 
 
 def save_dataset(
@@ -158,6 +217,28 @@ def add_terms(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "INSERT INTO terms VALUES (:id, :term, :definition, :synonyms, :dataset_id, :created_at)", rows
         )
     return rows
+
+
+def update_term(
+    term_id: str,
+    term: str,
+    definition: str,
+    synonyms: str,
+    dataset_id: str | None,
+) -> dict[str, Any] | None:
+    with connection() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE terms
+            SET term = ?, definition = ?, synonyms = ?, dataset_id = ?
+            WHERE id = ?
+            """,
+            (term.strip(), definition.strip(), synonyms.strip(), dataset_id, term_id),
+        )
+        if cursor.rowcount == 0:
+            return None
+        row = conn.execute("SELECT * FROM terms WHERE id = ?", (term_id,)).fetchone()
+        return dict(row) if row else None
 
 
 def delete_term(term_id: str) -> bool:
