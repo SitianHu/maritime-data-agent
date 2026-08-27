@@ -6,5 +6,6 @@ __pycache__/
 .env.local
 data/*.db
 data/uploads/
+data/fm_code.xlsx
 tests/
 
