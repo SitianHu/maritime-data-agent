@@ -276,6 +276,7 @@ async def ask(payload: AskRequest) -> dict[str, Any]:
                 "total_tokens": None,
                 "sql_generation_tokens": None,
                 "answer_generation_tokens": None,
+                "sql_generation_cached": False,
             },
         }
 
@@ -367,6 +368,7 @@ async def ask(payload: AskRequest) -> dict[str, Any]:
             ),
             "sql_generation_tokens": sql_call.total_tokens,
             "answer_generation_tokens": answer_call.total_tokens,
+            "sql_generation_cached": sql_call.cached,
         },
     }
 
