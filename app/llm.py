@@ -73,12 +73,17 @@ async def chat(
     try:
         body = response.json()
         usage = body.get("usage") or {}
+        prompt_tokens = usage.get("prompt_tokens", usage.get("input_tokens"))
+        completion_tokens = usage.get("completion_tokens", usage.get("output_tokens"))
+        total_tokens = usage.get("total_tokens")
+        if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
+            total_tokens = prompt_tokens + completion_tokens
         return ChatResult(
             content=body["choices"][0]["message"]["content"],
             elapsed_ms=round((time.perf_counter() - started_at) * 1000),
-            prompt_tokens=usage.get("prompt_tokens"),
-            completion_tokens=usage.get("completion_tokens"),
-            total_tokens=usage.get("total_tokens"),
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
         )
     except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
         raise RuntimeError("模型接口返回格式不兼容 OpenAI Chat Completions") from exc
@@ -248,7 +253,14 @@ async def generate_sql(
     if cache_key in _SQL_CACHE:
         sql, reasoning_summary, content = _SQL_CACHE.pop(cache_key)
         _SQL_CACHE[cache_key] = (sql, reasoning_summary, content)
-        return sql, reasoning_summary, ChatResult(content=content, elapsed_ms=0, cached=True)
+        return sql, reasoning_summary, ChatResult(
+            content=content,
+            elapsed_ms=0,
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+            cached=True,
+        )
 
     schema = "\n".join(f'- "{col["name"]}" ({col["type"]})' for col in columns)
     glossary = "\n".join(

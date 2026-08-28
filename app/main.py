@@ -489,17 +489,17 @@ async def ask(payload: AskRequest) -> dict[str, Any]:
             "answer_generation_elapsed_ms": answer_call.elapsed_ms,
             "prompt_tokens": (
                 (sql_call.prompt_tokens or 0) + (answer_call.prompt_tokens or 0)
-                if sql_call.prompt_tokens is not None and answer_call.prompt_tokens is not None
+                if sql_call.prompt_tokens is not None or answer_call.prompt_tokens is not None
                 else None
             ),
             "completion_tokens": (
                 (sql_call.completion_tokens or 0) + (answer_call.completion_tokens or 0)
-                if sql_call.completion_tokens is not None and answer_call.completion_tokens is not None
+                if sql_call.completion_tokens is not None or answer_call.completion_tokens is not None
                 else None
             ),
             "total_tokens": (
                 (sql_call.total_tokens or 0) + (answer_call.total_tokens or 0)
-                if sql_call.total_tokens is not None and answer_call.total_tokens is not None
+                if sql_call.total_tokens is not None or answer_call.total_tokens is not None
                 else None
             ),
             "sql_generation_tokens": sql_call.total_tokens,

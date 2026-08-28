@@ -7,6 +7,7 @@
   <link rel="stylesheet" href="/static/style.css?v=20260823-terms-import" />
   <link rel="stylesheet" href="/static/code_admin.css?v=20260827-grouped" />
   <link rel="stylesheet" href="/static/code_admin_overrides.css?v=20260827-inner-scroll-only" />
+  <style>@media (min-width: 761px) { .conversation-list { max-height: 50vh; } }</style>
 </head>
 <body>
   <div class="shell">
@@ -23,7 +24,6 @@
         <div class="conversation-head"><span>对话</span><button id="new-conversation" type="button">＋</button></div>
         <div id="conversation-list" class="conversation-list"></div>
       </section>
-      <div class="privacy"><b>API 密钥由你掌控</b><span>仅保存在当前浏览器会话，不落盘到服务端。</span></div>
     </aside>
     <main>
       <header><div><h1 id="page-title">问数助手</h1><p id="page-subtitle">自动识别意图和数据表，用自然语言获得答案</p></div><div class="status"><i></i><span id="model-status">未配置模型</span></div></header>
@@ -76,7 +76,7 @@
   <dialog id="term-dialog"><form id="term-form"><div class="modal-head"><h3>新增业务术语</h3><button type="button" data-close>×</button></div><label>术语<input name="term" required placeholder="例如：活跃客户" /></label><label>定义<textarea name="definition" required placeholder="例如：过去 30 天内至少下单一次的客户"></textarea></label><label>同义词<input name="synonyms" placeholder="例如：有效客户, 活客" /></label><label>关联数据表<select name="dataset_id"></select></label><div class="actions"><button type="button" class="ghost" data-close>取消</button><button class="primary">保存术语</button></div></form></dialog>
   <dialog id="term-import-dialog"><form id="term-import-form"><div class="modal-head"><h3>批量导入术语</h3><button type="button" data-close>×</button></div><p class="dialog-tip">Excel 首行字段必须为：术语、定义、同义词、关联数据表。关联数据表可填写系统中的数据表名称；留空或填写“全局术语”表示全局范围。</p><label class="drop">选择 XLSX / XLS 文件<input name="file" type="file" accept=".xlsx,.xls" required /></label><div class="actions"><button type="button" class="ghost" data-close>取消</button><button class="primary">开始导入</button></div></form></dialog>
   <div id="toast"></div>
-  <script src="/static/app.js?v=20260827-code-inline"></script>
+  <script src="/static/app.js?v=20260828-answer-folding"></script>
   <script src="/static/code_admin.js?v=20260827-one-line-title"></script>
 </body>
 </html>

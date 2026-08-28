@@ -177,18 +177,24 @@ $('#test-model').onclick = async () => { const el=$('#model-result');el.textCont
 
 function splitAnswerSections(content) {
   const names = ['直接结论', '统计范围', '结果明细', '统计口径', '可追溯信息', '注意事项'];
-  const pattern = new RegExp(`(?:^|\\n)(${names.join('|')})[:：]\\s*\\n?`, 'g');
-  const sections = {}; let match, last = null, lastIndex = 0;
-  while ((match = pattern.exec(content)) !== null) {
-    if (last) sections[last] = content.slice(lastIndex, match.index).trim();
-    last = match[1]; lastIndex = pattern.lastIndex;
+  // 按行识别标题，兼容 Markdown、阿拉伯/中文编号、项目符号和方括号标题。
+  const order = '(?:(?:\\d+|[一二三四五六七八九十]+)[.)、．]|[（(](?:\\d+|[一二三四五六七八九十]+)[）)])';
+  const emphasis = '(?:\\*\\*|__)?';
+  const pattern = new RegExp(`^[ \\t]*(?:(?:#{1,6}|[-+*])[ \\t]*)?${emphasis}(?:${order}[ \\t]*)?${emphasis}(?:【|\\[)?(${names.join('|')})(?:\\*\\*|__|】|\\])?[ \\t]*(?:[:：][ \\t]*)?(?:\\*\\*|__)?(.*)$`);
+  const sections = {}; let current = null;
+  for (const line of String(content).replace(/\\r\\n?/g, '\n').split('\n')) {
+    const match = line.match(pattern);
+    if (match) {
+      current = match[1];
+      sections[current] = match[2].trim();
+    } else if (current) {
+      sections[current] = `${sections[current]}\n${line}`.trim();
+    }
   }
-  if (last) sections[last] = content.slice(lastIndex).trim();
   return sections;
 }
 function renderSection(title, body) { return body ? `<section class="answer-section"><b>${escapeHtml(title)}</b><div class="answer-section-body">${escapeHtml(body)}</div></section>` : ''; }
-function renderAnswerContent(content, details) {
-  if (!details) return escapeHtml(content);
+function renderAnswerContent(content) {
   const sections = splitAnswerSections(content);
   if (!sections['直接结论'] && !sections['结果明细']) return escapeHtml(content);
   const visible = `${renderSection('直接结论', sections['直接结论'])}${renderSection('结果明细', sections['结果明细'])}`;
@@ -207,7 +213,7 @@ function addMessage(role, content, details, persist = true) {
     const codeDetails=codeRequests.length?`<section class="reasoning-summary"><b>字段编码映射</b>${codeRequests.map(x=>`<p>${escapeHtml(x.table)}.${escapeHtml(x.column)} · ${escapeHtml(x.code_type)} · ${escapeHtml(x.purpose)}${x.mention?` · “${escapeHtml(x.mention)}” → ${escapeHtml((x.code_values||[]).join(', '))}`:''}</p>`).join('')}</section>`:'';
     extra=`<div class="run-stats"><span>总耗时 <b>${formatDuration(metrics.total_elapsed_ms)}</b></span><span>Token <b>${tokens}</b></span>${codeBadge}${metrics.sql_generation_cached?'<span>SQL <b>缓存命中</b></span>':''}</div><details class="meta-panel"><summary>查看 SQL 生成过程、SQL 和查询结果</summary><section class="reasoning-summary"><b>SQL 生成依据</b><p>${escapeHtml(details.reasoning_summary||'暂无生成依据记录')}</p></section>${codeDetails}<div class="metric-grid"><span>SQL 生成<strong>${sqlTime} · ${formatTokens(metrics.sql_generation_tokens)}</strong></span><span>数据库查询<strong>${formatDuration(metrics.query_elapsed_ms)}</strong></span><span>答案生成<strong>${formatDuration(metrics.answer_generation_elapsed_ms)} · ${formatTokens(metrics.answer_generation_tokens)}</strong></span><span>Token 明细<strong>输入 ${formatTokens(metrics.prompt_tokens)} / 输出 ${formatTokens(metrics.completion_tokens)}</strong></span></div><pre>${escapeHtml(details.sql)}</pre>${rows?`<div class="result-table"><table><thead><tr>${heads}</tr></thead><tbody>${rows}</tbody></table></div>`:'<p>查询结果为空</p>'}</details>`;
   }
-  const renderedContent = role === 'assistant' ? renderAnswerContent(content, details) : escapeHtml(content);
+  const renderedContent = role === 'assistant' ? renderAnswerContent(content) : escapeHtml(content);
   wrap.innerHTML=`<div class="bubble">${renderedContent}${extra}</div>`;$('#messages').append(wrap);$('#messages').scrollTop=$('#messages').scrollHeight;if(persist){const item=activeConversation();if(item){item.messages.push({role,content,details:details||null});item.updatedAt=Date.now();if(item.title==='新对话'&&role==='user')item.title=content.slice(0,18);saveConversations();renderConversationList()}}return wrap;
 }
 function formatDuration(ms){if(ms==null)return'--';return ms<1000?`${ms} ms`:`${(ms/1000).toFixed(2)} s`}
