@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -104,6 +105,15 @@ def template_spec(intent_type: str) -> dict[str, Any]:
     return TEMPLATE_SPECS.get(intent_type, TEMPLATE_SPECS["generic_sql_query"])
 
 
+def _sql_time_range(sql: str) -> str:
+    predicates = re.findall(
+        r'((?:[A-Za-z_]\w*\.)?["`\[]?[A-Za-z_\u4e00-\u9fff]*(?:time|date|时间|日期)[A-Za-z_\u4e00-\u9fff]*["`\]]?\s*(?:BETWEEN\s+[^\s,)]+\s+AND\s+[^\s,)]+|(?:>=|<=|>|<|=)\s*[^\s,)]+))',
+        sql,
+        re.I,
+    )
+    return "；".join(dict.fromkeys(item.strip() for item in predicates)) or "由查询条件限定，SQL 未包含可提取的显式时间条件"
+
+
 def _result_summary(columns: list[str], rows: list[dict[str, Any]], truncated: bool) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "returned_row_count": len(rows),
@@ -145,7 +155,7 @@ def build_trace_record(
         "intent_type": route_info.get("intent_type", "generic_sql_query"),
         "intent_label": route_info.get("intent_label", "通用 SQL 查询"),
         "route": route_info.get("route", "SQL"),
-        "time_range": {"description": "由问题、命中术语和生成 SQL 共同确定"},
+        "time_range": {"description": _sql_time_range(sql)},
         "spatial_scope": {
             "description": route_info.get("spatial_scope") or "由数据表与问题共同确定",
         },
@@ -156,11 +166,33 @@ def build_trace_record(
         "metric": route_info.get("metric", "查询结果"),
         "filters": {"description": "详见生成 SQL 与命中术语"},
         "ontology_terms": [
-            {"term": item["term"], "definition": item["definition"], "dataset_id": item.get("dataset_id")}
+            {
+                "term": item["term"],
+                "definition": item["definition"],
+                "dataset_id": item.get("dataset_id"),
+                "match_sources": item.get("match_sources", []),
+                "semantic_score": item.get("semantic_score"),
+            }
             for item in matched_terms
         ],
+        "term_retrieval": route_info.get("term_retrieval", {}),
         "business_rules": route_info.get("methodology", []),
-        "tables_used": [route_info.get("table_name")] if route_info.get("table_name") else [],
+        "tables_used": route_info.get("table_names") or ([route_info.get("table_name")] if route_info.get("table_name") else []),
+        "relationship_used": route_info.get("relationships", []),
+        "join_fields": ([
+            {"left": f'{item["left_table_name"]}.{item["left_field"]}',
+             "right": f'{item["right_table_name"]}.{item["right_field"]}', "meaning": item["meaning"]}
+            for item in route_info.get("relationships", [])
+        ][0] if len(route_info.get("relationships", [])) == 1 else [
+            {"left": f'{item["left_table_name"]}.{item["left_field"]}',
+             "right": f'{item["right_table_name"]}.{item["right_field"]}', "meaning": item["meaning"]}
+            for item in route_info.get("relationships", [])
+        ]),
+        "record_grains": [
+            {"left": item["left_grain"], "right": item["right_grain"]}
+            for item in route_info.get("relationships", [])
+        ],
+        "deduplication": route_info.get("deduplication"),
         "fields_used": columns,
         "generated_sql": sql,
         "sql_check_result": {"status": "passed", "readonly": True},
@@ -179,7 +211,7 @@ def build_need_clarification_payload(question: str, route_info: dict[str, Any]) 
     candidate_text = "、".join(item.get("dataset_name", "") for item in candidates if item.get("dataset_name")) or "无"
     return {
         "answer_status": "need_clarification",
-        "direct_answer": "当前无法确定应该使用哪张数据表，请指定数据表或补充问题条件。",
+        "direct_answer": route_info.get("reasons", ["当前无法确定应该使用哪张数据表，请指定数据表或补充问题条件。"])[0],
         "scope": {
             "time_range": "未确定",
             "spatial_scope": "未确定",
@@ -262,15 +294,24 @@ def answer_generation_prompt(
 ) -> str:
     spec = template_spec(route_info.get("intent_type", "generic_sql_query"))
     payload_text = json.dumps(answer_payload, ensure_ascii=False, default=str, indent=2)
-    trace_text = json.dumps(trace_record, ensure_ascii=False, default=str, indent=2)
+    compact_trace = {key: trace_record.get(key) for key in (
+        "query_id", "intent_type", "intent_label", "route", "tables_used", "time_range",
+        "spatial_scope", "subject", "metric", "deduplication", "data_update_time",
+        "result_summary", "warnings",
+    )}
+    trace_text = json.dumps(compact_trace, ensure_ascii=False, default=str, indent=2)
     spec_text = json.dumps(spec, ensure_ascii=False, default=str, indent=2)
+    compact_route = {key: route_info.get(key) for key in (
+        "intent_type", "intent_label", "route", "subject", "metric", "spatial_scope",
+        "deduplication", "methodology", "table_names",
+    )}
     return f"""根据以下输入生成智能问数回答。
 
 用户原始问题：
 {question}
 
 系统识别结果：
-{json.dumps(route_info, ensure_ascii=False, default=str, indent=2)}
+{json.dumps(compact_route, ensure_ascii=False, default=str, indent=2)}
 
 回答模板约束：
 {spec_text}

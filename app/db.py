@@ -53,6 +53,33 @@ def init_db() -> None:
                 FOREIGN KEY(dataset_id) REFERENCES datasets(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_terms_dataset ON terms(dataset_id);
+            CREATE TABLE IF NOT EXISTS dataset_relationships (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                left_dataset_id TEXT NOT NULL,
+                left_field TEXT NOT NULL,
+                right_dataset_id TEXT NOT NULL,
+                right_field TEXT NOT NULL,
+                meaning TEXT NOT NULL,
+                left_grain TEXT NOT NULL,
+                right_grain TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(left_dataset_id) REFERENCES datasets(id) ON DELETE CASCADE,
+                FOREIGN KEY(right_dataset_id) REFERENCES datasets(id) ON DELETE CASCADE,
+                CHECK(left_dataset_id <> right_dataset_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_relationships_datasets
+                ON dataset_relationships(left_dataset_id, right_dataset_id, enabled);
+            CREATE TABLE IF NOT EXISTS term_embeddings (
+                term_id TEXT PRIMARY KEY,
+                model_name TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                vector_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(term_id) REFERENCES terms(id) ON DELETE CASCADE
+            );
 
             CREATE TABLE IF NOT EXISTS code_dictionary_versions (
                 id TEXT PRIMARY KEY,
@@ -156,12 +183,32 @@ def save_dataset(
         )
 
 
+def rename_dataset(dataset_id: str, name: str) -> dict[str, Any] | None:
+    cleaned_name = name.strip()
+    if not cleaned_name:
+        raise ValueError("数据表名称不能为空")
+    with connection() as conn:
+        row = conn.execute("SELECT id FROM datasets WHERE id = ?", (dataset_id,)).fetchone()
+        if not row:
+            return None
+        duplicate = conn.execute(
+            "SELECT id FROM datasets WHERE id <> ? AND lower(name) = lower(?)",
+            (dataset_id, cleaned_name),
+        ).fetchone()
+        if duplicate:
+            raise ValueError("数据表名称已存在")
+        conn.execute("UPDATE datasets SET name = ? WHERE id = ?", (cleaned_name, dataset_id))
+    return get_dataset(dataset_id)
+
+
 def delete_dataset(dataset_id: str) -> bool:
     dataset = get_dataset(dataset_id)
     if not dataset:
         return False
     with connection() as conn:
         conn.execute(f'DROP TABLE IF EXISTS "{dataset["table_name"]}"')
+        conn.execute("DELETE FROM dataset_relationships WHERE left_dataset_id = ? OR right_dataset_id = ?", (dataset_id, dataset_id))
+        conn.execute("DELETE FROM term_embeddings WHERE term_id IN (SELECT id FROM terms WHERE dataset_id = ?)", (dataset_id,))
         conn.execute("DELETE FROM terms WHERE dataset_id = ?", (dataset_id,))
         conn.execute("DELETE FROM datasets WHERE id = ?", (dataset_id,))
     return True
@@ -193,8 +240,13 @@ def add_term(term: str, definition: str, synonyms: str, dataset_id: str | None) 
     }
     with connection() as conn:
         conn.execute(
-            "INSERT INTO terms VALUES (:id, :term, :definition, :synonyms, :dataset_id, :created_at)", item
+            """
+            INSERT INTO terms (id, term, definition, synonyms, dataset_id, created_at)
+            VALUES (:id, :term, :definition, :synonyms, :dataset_id, :created_at)
+            """,
+            item,
         )
+        conn.execute("DELETE FROM term_embeddings WHERE term_id = ?", (item["id"],))
     return item
 
 
@@ -214,7 +266,11 @@ def add_terms(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
     with connection() as conn:
         conn.executemany(
-            "INSERT INTO terms VALUES (:id, :term, :definition, :synonyms, :dataset_id, :created_at)", rows
+            """
+            INSERT INTO terms (id, term, definition, synonyms, dataset_id, created_at)
+            VALUES (:id, :term, :definition, :synonyms, :dataset_id, :created_at)
+            """,
+            rows,
         )
     return rows
 
@@ -237,11 +293,13 @@ def update_term(
         )
         if cursor.rowcount == 0:
             return None
+        conn.execute("DELETE FROM term_embeddings WHERE term_id = ?", (term_id,))
         row = conn.execute("SELECT * FROM terms WHERE id = ?", (term_id,)).fetchone()
         return dict(row) if row else None
 
 
 def delete_term(term_id: str) -> bool:
     with connection() as conn:
+        conn.execute("DELETE FROM term_embeddings WHERE term_id = ?", (term_id,))
         cursor = conn.execute("DELETE FROM terms WHERE id = ?", (term_id,))
     return cursor.rowcount > 0

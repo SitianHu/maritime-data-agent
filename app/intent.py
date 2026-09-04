@@ -261,7 +261,42 @@ def _confidence(score: int, second_score: int, manual: bool) -> float:
     return round(min(0.98, 0.45 + score / 24 + margin / 20), 2)
 
 
-def _make_candidate(dataset: dict[str, Any], score: int, spec: IntentSpec, reasons: list[str]) -> dict[str, Any]:
+def _prefer_realtime_primary(question: str, candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Resolve a tied multi-table route when the requested output is a current vessel snapshot."""
+    if not candidates:
+        return None
+    current_cues = ("当前", "现在", "实时")
+    snapshot_fields = ("吃水", "draught", "船名", "目的港", "航速", "航向", "经纬度", "位置", "船长", "船宽")
+    negative_event_cues = ("没有", "无任何", "无违规", "未发生", "不存在")
+    vessel_output_cues = ("船舶", "船只", "哪些船", "船有哪些")
+    if not any(_contains(question, cue) for cue in current_cues):
+        return None
+    requests_snapshot = any(_contains(question, cue) for cue in snapshot_fields)
+    requests_negative_vessel_set = (
+        any(_contains(question, cue) for cue in negative_event_cues)
+        and any(_contains(question, cue) for cue in vessel_output_cues)
+    )
+    if not requests_snapshot and not requests_negative_vessel_set:
+        return None
+    top_score = candidates[0]["score"]
+    return next(
+        (
+            item for item in candidates
+            if (requests_negative_vessel_set or item["score"] == top_score)
+            and (requests_negative_vessel_set or item.get("has_table_evidence"))
+            and "data_real_time" in str(item.get("table_name", "")).lower()
+        ),
+        None,
+    )
+
+
+def _make_candidate(
+    dataset: dict[str, Any],
+    score: int,
+    spec: IntentSpec,
+    reasons: list[str],
+    has_table_evidence: bool,
+) -> dict[str, Any]:
     return {
         "dataset_id": dataset["id"],
         "dataset_name": dataset["name"],
@@ -270,6 +305,9 @@ def _make_candidate(dataset: dict[str, Any], score: int, spec: IntentSpec, reaso
         "intent_type": spec.intent_type,
         "intent_label": spec.label,
         "reasons": reasons[:8],
+        # Global terms describe the question but do not prove that this
+        # particular table is needed in a multi-table query.
+        "has_table_evidence": has_table_evidence,
     }
 
 
@@ -301,7 +339,13 @@ def route_question(
         column_score, column_reasons = _score_columns(question, dataset)
         spec_score, spec, spec_reasons = _score_specs(question, dataset)
         total = name_score + term_score + column_score + spec_score
-        scored.append(_make_candidate(dataset, total, spec, [*name_reasons, *spec_reasons, *term_reasons, *column_reasons]))
+        scored.append(_make_candidate(
+            dataset,
+            total,
+            spec,
+            [*name_reasons, *spec_reasons, *term_reasons, *column_reasons],
+            bool(name_reasons or spec_reasons or term_reasons or column_reasons),
+        ))
 
     scored.sort(key=lambda item: item["score"], reverse=True)
 
@@ -320,9 +364,13 @@ def route_question(
             "methodology": list(spec.methodology),
             "time_fields": list(spec.time_fields),
             "selection_mode": "manual",
-            "candidates": scored[:3],
+            "candidates": scored,
         }
 
+    preferred_primary = _prefer_realtime_primary(question, scored)
+    if preferred_primary is not None and preferred_primary is not scored[0]:
+        scored.remove(preferred_primary)
+        scored.insert(0, preferred_primary)
     top = scored[0]
     second_score = scored[1]["score"] if len(scored) > 1 else 0
     if top["score"] <= 0 and len(datasets) > 1:
@@ -339,10 +387,10 @@ def route_question(
             "time_fields": [],
             "selection_mode": "auto",
             "reasons": ["未识别到明确的数据表、术语或字段线索"],
-            "candidates": scored[:3],
+            "candidates": scored,
         }
 
-    if top["score"] == second_score and top["score"] < 8 and len(datasets) > 1:
+    if preferred_primary is None and top["score"] == second_score and top["score"] < 8 and len(datasets) > 1:
         return {
             **top,
             "answer_status": "need_clarification",
@@ -356,7 +404,7 @@ def route_question(
             "time_fields": [],
             "selection_mode": "auto",
             "reasons": ["候选数据表不唯一"],
-            "candidates": scored[:3],
+            "candidates": scored,
         }
 
     spec = next((item for item in INTENT_SPECS if item.intent_type == top["intent_type"]), GENERIC_INTENT)
@@ -372,5 +420,8 @@ def route_question(
         "methodology": list(spec.methodology),
         "time_fields": list(spec.time_fields),
         "selection_mode": "auto",
-        "candidates": scored[:3],
+        # Multi-table selection must be able to inspect every relevant table.
+        # Truncating this list to three made an enabled relationship invisible
+        # whenever an unrelated table happened to rank above its other side.
+        "candidates": scored,
     }

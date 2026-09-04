@@ -376,6 +376,31 @@ def resolve_code_context(question: str, dataset: dict[str, Any], route_info: dic
     return {"version": version, "requests": requests, "mappings": mappings, "warnings": warnings}
 
 
+def resolve_code_contexts(question: str, datasets: list[dict[str, Any]], route_info: dict[str, Any]) -> dict[str, Any]:
+    contexts = [resolve_code_context(question, dataset, route_info) for dataset in datasets]
+    # When a dedicated status-event table participates in the query, phrases
+    # such as “当前处于航行状态” describe event_name_code/event_type_code rather
+    # than the AIS snapshot navstatus field.  Do not force an unrelated
+    # NAV_STATUS lookup from the realtime table before SQL generation.
+    has_status_events = any(
+        {"event_name_code", "event_type_code"}.issubset(
+            {str(column.get("name", "")).lower() for column in dataset.get("columns", [])}
+        ) and "status" in str(dataset.get("table_name", "")).lower()
+        for dataset in datasets
+    )
+    if has_status_events and any(cue in question for cue in ("航行", "锚泊", "靠泊", "当前处于")):
+        for context in contexts:
+            context["requests"] = [item for item in context.get("requests", []) if item["code_type"] != "NAV_STATUS"]
+            context["mappings"] = [item for item in context.get("mappings", []) if item["code_type"] != "NAV_STATUS"]
+    version = next((context["version"] for context in contexts if context.get("version")), None)
+    return {
+        "version": version,
+        "requests": [item for context in contexts for item in context.get("requests", [])],
+        "mappings": [item for context in contexts for item in context.get("mappings", [])],
+        "warnings": list(dict.fromkeys(warning for context in contexts for warning in context.get("warnings", []))),
+    }
+
+
 def prompt_block(context: dict[str, Any]) -> str:
     if not context.get("requests"):
         return "无。本次问题不涉及已绑定的编码字段。"
@@ -404,11 +429,20 @@ def validate_required_filters(sql: str, context: dict[str, Any]) -> None:
     where_clause = re.split(r"\b(?:GROUP\s+BY|ORDER\s+BY|LIMIT)\b", re.split(r"\bWHERE\b", sql, maxsplit=1, flags=re.I)[-1], maxsplit=1, flags=re.I)[0] if re.search(r"\bWHERE\b", sql, re.I) else ""
     for request in context.get("requests", []):
         column_pattern = rf'["`\[]?{re.escape(request["column"])}["`\]]?'
+        table_pattern = rf'["`\[]?{re.escape(request["table"])}["`\]]?'
+        alias_matches = re.findall(
+            rf'\b(?:FROM|JOIN)\s+{table_pattern}(?:\s+(?:AS\s+)?([A-Za-z_]\w*))?', sql, re.I
+        )
+        aliases = [alias for alias in alias_matches if alias.lower() not in {"where", "on", "join", "left", "right", "inner", "group", "order"}]
+        qualified_patterns = [rf'(?:{table_pattern}|["`\[]?{re.escape(alias)}["`\]]?)\s*\.\s*{column_pattern}' for alias in aliases]
+        qualified_patterns.append(rf'{table_pattern}\s*\.\s*{column_pattern}')
+        qualified_column = "(?:" + "|".join(qualified_patterns) + ")"
+        multiple_tables = len({item["table"] for item in context.get("requests", [])}) > 1
         if request["purpose"] != "filter" or not request["code_values"]:
             if where_clause and re.search(column_pattern, where_clause, re.I):
                 raise ValueError(f'用户描述未匹配到 {request["code_type"]} 的明确编码，禁止猜测筛选值')
             continue
-        if not re.search(column_pattern, sql, re.I):
+        if not re.search(qualified_column if multiple_tables else column_pattern, sql, re.I):
             raise ValueError(f'生成的 SQL 未使用编码字段 {request["column"]}')
         if not any(re.search(rf"(?<![\w.])['\"]?{re.escape(value)}['\"]?(?![\w.])", sql) for value in request["code_values"]):
             raise ValueError(f'生成的 SQL 未使用“{request["mention"]}”对应的真实编码')
@@ -418,8 +452,14 @@ def translate_result(
     columns: list[str], rows: list[dict[str, Any]], context: dict[str, Any]
 ) -> tuple[list[dict[str, Any]], list[str]]:
     by_column: dict[str, dict[str, str]] = {}
+    scoped: dict[str, dict[str, dict[str, str]]] = {}
     for item in context.get("mappings", []):
-        by_column.setdefault(item["column"], {})[item["code_value"]] = item["description"]
+        by_column.setdefault(f'{item["table"]}__{item["column"]}', {})[item["code_value"]] = item["description"]
+        scoped.setdefault(item["column"], {}).setdefault(item["table"], {})[item["code_value"]] = item["description"]
+    for column, table_mappings in scoped.items():
+        unique = {json.dumps(mapping, ensure_ascii=False, sort_keys=True) for mapping in table_mappings.values()}
+        if len(unique) == 1:
+            by_column[column] = next(iter(table_mappings.values()))
     if not by_column:
         return rows, []
     warnings: set[str] = set()

@@ -2,23 +2,29 @@ from __future__ import annotations
 
 import io
 import json
+import asyncio
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 from pydantic import BaseModel, Field
 
-from . import code_dictionary, db
+from . import code_dictionary, db, relationships
 from .answer import build_answer_payload, build_need_clarification_payload, build_trace_record
 from .intent import route_question
 from .llm import ModelConfig, generate_sql, summarize
-from .query import execute_readonly, get_data_update_time, validate_sql
+from .multitable import JOIN_KEY_PAIRS, TABLE_PURPOSES, build_multitable_context, select_terms_for_context
+from .query import execute_readonly, get_data_update_time, validate_question_semantics, validate_sql
+from .term_retrieval import retrieve_terms
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
@@ -58,10 +64,32 @@ class CodeBindingCreate(BaseModel):
     enabled: bool = True
 
 
+class RelationshipCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    left_dataset_id: str
+    left_field: str = Field(min_length=1, max_length=200)
+    right_dataset_id: str
+    right_field: str = Field(min_length=1, max_length=200)
+    meaning: str = Field(min_length=1, max_length=1000)
+    left_grain: str = Field(min_length=1, max_length=500)
+    right_grain: str = Field(min_length=1, max_length=500)
+    enabled: bool = True
+
+
+class RelationshipStatus(BaseModel):
+    enabled: bool
+
+
 class AskRequest(BaseModel):
     dataset_id: str | None = None
+    secondary_dataset_id: str | None = None
+    dataset_ids: list[str] = Field(default_factory=list)
     question: str = Field(min_length=1, max_length=2000)
     model: dict[str, Any]
+
+
+class DatasetRename(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
 
 
 def clean_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -143,7 +171,78 @@ async def upload_dataset(
 def remove_dataset(dataset_id: str) -> dict[str, bool]:
     if not db.delete_dataset(dataset_id):
         raise HTTPException(404, "数据集不存在")
+    from .llm import clear_sql_cache
+    clear_sql_cache()
     return {"ok": True}
+
+
+@app.patch("/api/datasets/{dataset_id}")
+def rename_dataset(dataset_id: str, payload: DatasetRename) -> dict[str, Any]:
+    try:
+        dataset = db.rename_dataset(dataset_id, payload.name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not dataset:
+        raise HTTPException(404, "数据表不存在")
+    from .llm import clear_sql_cache
+    clear_sql_cache()
+    return dataset
+
+
+@app.get("/api/relationships")
+def relationship_list() -> list[dict[str, Any]]:
+    return relationships.list_relationships()
+
+
+@app.get("/api/relationship-rules")
+def relationship_rules() -> dict[str, Any]:
+    return {"join_key_pairs": JOIN_KEY_PAIRS, "table_purposes": TABLE_PURPOSES}
+
+
+@app.post("/api/relationships")
+def create_relationship(payload: RelationshipCreate) -> dict[str, Any]:
+    try:
+        return relationships.save_relationship(payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.put("/api/relationships/{relationship_id}")
+def edit_relationship(relationship_id: str, payload: RelationshipCreate) -> dict[str, Any]:
+    try:
+        return relationships.save_relationship(payload.model_dump(), relationship_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.patch("/api/relationships/{relationship_id}/status")
+def relationship_status(relationship_id: str, payload: RelationshipStatus) -> dict[str, Any]:
+    try:
+        item = relationships.set_enabled(relationship_id, payload.enabled)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not item:
+        raise HTTPException(404, "关系不存在")
+    return item
+
+
+@app.delete("/api/relationships/{relationship_id}")
+def remove_relationship(relationship_id: str) -> dict[str, bool]:
+    if not relationships.delete_relationship(relationship_id):
+        raise HTTPException(404, "关系不存在")
+    return {"ok": True}
+
+
+@app.get("/api/relationships/{relationship_id}/check")
+def check_relationship(relationship_id: str) -> dict[str, Any]:
+    try:
+        return relationships.inspect_relationship(relationship_id)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.get("/api/datasets/{dataset_id}/preview")
@@ -347,6 +446,52 @@ async def import_terms(file: UploadFile = File(...)) -> dict[str, Any]:
     return {"imported": len(rows), "skipped": skipped, "total": len(rows) + skipped}
 
 
+def build_terms_export() -> io.BytesIO:
+    """Build a round-trip compatible terms workbook in memory."""
+    datasets = {item["id"]: item["name"] for item in db.list_datasets()}
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "术语库"
+    headers = ["术语", "定义", "同义词", "关联数据表"]
+    sheet.append(headers)
+    for item in db.list_terms():
+        dataset_id = item.get("dataset_id")
+        sheet.append([
+            item["term"],
+            item["definition"],
+            item.get("synonyms", ""),
+            datasets.get(dataset_id, "全局术语" if not dataset_id else ""),
+        ])
+
+    header_fill = PatternFill("solid", fgColor="635BFF")
+    for cell in sheet[1]:
+        cell.fill = header_fill
+        cell.font = Font(color="FFFFFF", bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    sheet.freeze_panes = "A2"
+    sheet.auto_filter.ref = f"A1:D{max(1, sheet.max_row)}"
+    for column, width in {"A": 24, "B": 64, "C": 36, "D": 30}.items():
+        sheet.column_dimensions[column].width = width
+    for row in sheet.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+    output = io.BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    return output
+
+
+@app.get("/api/terms/export")
+def export_terms() -> StreamingResponse:
+    filename = f"terms_export_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}.xlsx"
+    return StreamingResponse(
+        build_terms_export(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.delete("/api/terms/{term_id}")
 def remove_term(term_id: str) -> dict[str, bool]:
     if not db.delete_term(term_id):
@@ -372,6 +517,7 @@ async def ask(payload: AskRequest) -> dict[str, Any]:
     datasets = db.list_datasets()
     all_terms = db.list_terms()
     route_info = route_question(payload.question, datasets, all_terms, payload.dataset_id)
+    route_info["question"] = payload.question
     if route_info.get("answer_status") == "need_clarification":
         answer_payload = build_need_clarification_payload(payload.question, route_info)
         return {
@@ -408,13 +554,33 @@ async def ask(payload: AskRequest) -> dict[str, Any]:
             },
         }
 
-    dataset = db.get_dataset(route_info["dataset_id"])
-    if not dataset:
+    multi_table_context = build_multitable_context(payload.question, datasets, all_terms, route_info)
+    selected_ids = [item["dataset_id"] for item in multi_table_context.get("tables", [])]
+    selected_datasets = [db.get_dataset(item) for item in selected_ids] or [db.get_dataset(route_info["dataset_id"])]
+    if not selected_datasets or any(not dataset for dataset in selected_datasets):
         raise HTTPException(404, "数据集不存在")
-    matched_terms = db.list_terms(dataset["id"], payload.question)
-    if not matched_terms:
-        matched_terms = db.list_terms(dataset["id"])[:30]
-    code_context = code_dictionary.resolve_code_context(payload.question, dataset, route_info)
+    dataset = selected_datasets[0]
+    context_terms = select_terms_for_context(all_terms, set(selected_ids), payload.question)
+    matched_terms: list[dict[str, Any]] = []
+    retrieval_traces: list[dict[str, Any]] = []
+    seen_term_ids: set[str] = set()
+    for selected in selected_datasets:
+        terms_for_dataset, trace = await asyncio.to_thread(retrieve_terms, payload.question, selected["id"])
+        retrieval_traces.append({"dataset_id": selected["id"], "dataset_name": selected["name"], **trace})
+        for item in terms_for_dataset:
+            if item["id"] in seen_term_ids:
+                continue
+            seen_term_ids.add(item["id"])
+            matched_terms.append({**item, "applicable_dataset_name": selected["name"] if item.get("dataset_id") else "全局"})
+    route_info["term_retrieval"] = {"datasets": retrieval_traces, "method": "+".join(dict.fromkeys(item["method"] for item in retrieval_traces))}
+    for item in context_terms:
+        if item["id"] not in seen_term_ids:
+            matched_terms.append({**item, "applicable_dataset_name": "全局" if not item.get("dataset_id") else next(
+                (dataset["name"] for dataset in selected_datasets if dataset["id"] == item.get("dataset_id")), "关联数据表")})
+            seen_term_ids.add(item["id"])
+    route_info["table_names"] = multi_table_context.get("allowed_tables", [dataset["table_name"]])
+    route_info["multi_table_context"] = multi_table_context
+    code_context = code_dictionary.resolve_code_contexts(payload.question, selected_datasets, route_info)
     if code_context.get("version"):
         route_info["code_dictionary_version"] = code_context["version"]["version_number"]
     route_info["code_lookup_requests"] = code_context.get("requests", [])
@@ -428,15 +594,24 @@ async def ask(payload: AskRequest) -> dict[str, Any]:
             matched_terms,
             route_info,
             code_context,
+            selected_datasets,
+            multi_table_context,
         )
-        sql = validate_sql(sql, dataset["table_name"])
+        sql = validate_sql(
+            sql, allowed_tables=multi_table_context.get("allowed_tables", [dataset["table_name"]]),
+        )
+        validate_question_semantics(sql, payload.question, multi_table_context)
         code_dictionary.validate_required_filters(sql, code_context)
         query_started_at = time.perf_counter()
         columns, rows, truncated = execute_readonly(sql)
         rows, mapping_warnings = code_dictionary.translate_result(columns, rows, code_context)
         execution_time_ms = (time.perf_counter() - query_started_at) * 1000
         query_elapsed_ms = round(execution_time_ms)
-        data_update_time = get_data_update_time(dataset["table_name"], [item["name"] for item in dataset["columns"]])
+        update_times = [
+            get_data_update_time(item["table_name"], [column["name"] for column in item["columns"]])
+            for item in selected_datasets
+        ]
+        data_update_time = max((value for value in update_times if value), default=None)
         trace_record = build_trace_record(
             question=payload.question,
             route_info=route_info,
@@ -447,7 +622,11 @@ async def ask(payload: AskRequest) -> dict[str, Any]:
             truncated=truncated,
             execution_time_ms=execution_time_ms,
             data_update_time=data_update_time,
-            warnings=[*code_context.get("warnings", []), *mapping_warnings],
+            warnings=[
+                *[trace["warning"] for trace in retrieval_traces if trace.get("warning")],
+                *code_context.get("warnings", []),
+                *mapping_warnings,
+            ],
         )
         answer_payload = build_answer_payload(
             route_info=route_info,
@@ -480,7 +659,16 @@ async def ask(payload: AskRequest) -> dict[str, Any]:
         "route": route_info,
         "answer_payload": answer_payload,
         "trace_record": trace_record,
-        "terms": [{"term": item["term"], "definition": item["definition"]} for item in matched_terms],
+        "terms": [
+            {
+                "term": item["term"],
+                "definition": item["definition"],
+                "dataset_id": item.get("dataset_id"),
+                "match_sources": item.get("match_sources", []),
+                "semantic_score": item.get("semantic_score"),
+            }
+            for item in matched_terms
+        ],
         "reasoning_summary": reasoning_summary,
         "metrics": {
             "total_elapsed_ms": round((time.perf_counter() - started_at) * 1000),

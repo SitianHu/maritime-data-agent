@@ -1,8 +1,9 @@
 const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => [...root.querySelectorAll(s)];
-const state = { datasets: [], terms: [], model: null, conversations: [], activeConversationId: null, pendingDeleteId: null, editingTermId: null };
+const state = { datasets: [], terms: [], relationships: [], model: null, conversations: [], activeConversationId: null, pendingDeleteId: null, editingTermId: null, editingRelationshipId: null };
 const CONVERSATIONS_KEY = 'smart-query-conversations';
 const ACTIVE_CONVERSATION_KEY = 'smart-query-active-conversation';
+const MODEL_CONFIG_KEY = 'smart-query-model';
 const titles = {
   chat: ['问数助手', '选择数据表，用自然语言获得答案'],
   datasets: ['数据表', '管理已上传的数据文件'],
@@ -28,14 +29,14 @@ function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
 }
 
-function createConversation() { return { id: crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`, title: '新对话', datasetId: '', messages: [], updatedAt: Date.now() }; }
+function createConversation() { return { id: crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`, title: '新对话', datasetId: '', secondaryDatasetId: '', relatedDatasetIds: [], messages: [], updatedAt: Date.now() }; }
 function activeConversation() { return state.conversations.find(item => item.id === state.activeConversationId); }
 function saveConversations() { localStorage.setItem(CONVERSATIONS_KEY, JSON.stringify(state.conversations)); localStorage.setItem(ACTIVE_CONVERSATION_KEY, state.activeConversationId || ''); }
 function renderConversationList() { $('#conversation-list').innerHTML=state.conversations.map(item=>`<div class="conversation-item ${item.id===state.activeConversationId?'active':''}" data-conversation-id="${item.id}"><button class="conversation-select" type="button"><span class="conversation-title">${escapeHtml(item.title)}</span><small class="conversation-meta">${item.messages.length} 条消息 · ${item.datasetId?'手动选择':'自动选表'}</small></button><span class="conversation-actions"><button type="button" data-action="rename" title="重命名">重命名</button><button type="button" data-action="delete" class="${state.pendingDeleteId===item.id?'confirm-delete':''}" title="删除">${state.pendingDeleteId===item.id?'确认删除':'删除'}</button></span></div>`).join(''); }
 function welcomeHtml() { return '<div class="welcome"><div class="orb">✦</div><h2>想从数据里了解什么？</h2><p>我会检索相关业务术语，生成并执行 SQL，然后用自然语言告诉你结果。</p><div class="examples"><button>这张表一共有多少条数据？</button><button>按类别统计数量，找出最多的三类</button><button>最近一个月的数据趋势如何？</button></div></div>'; }
 function renderMessages() { const item=activeConversation();$('#messages').innerHTML=item?.messages.length?'':welcomeHtml();item?.messages.forEach(message=>addMessage(message.role,message.content,message.details,false)); }
-function switchConversation(id) { if(!state.conversations.some(item=>item.id===id))return;state.activeConversationId=id;const item=activeConversation();$('#chat-dataset').value=state.datasets.some(d=>d.id===item.datasetId)?item.datasetId:'';if(item.datasetId&&!state.datasets.some(d=>d.id===item.datasetId))item.datasetId='';renderConversationList();renderMessages();saveConversations();showView('chat'); }
-function addConversation() { const item=createConversation();item.datasetId=$('#chat-dataset').value||'';state.conversations.unshift(item);state.activeConversationId=item.id;saveConversations();renderConversationList();renderMessages();showView('chat');$('#question').focus(); }
+function switchConversation(id) { if(!state.conversations.some(item=>item.id===id))return;state.activeConversationId=id;const item=activeConversation();$('#chat-dataset').value=state.datasets.some(d=>d.id===item.datasetId)?item.datasetId:'';const ids=item.relatedDatasetIds||(item.secondaryDatasetId?[item.secondaryDatasetId]:[]);[...$('#chat-secondary-dataset').options].forEach(x=>x.selected=ids.includes(x.value));if(item.datasetId&&!state.datasets.some(d=>d.id===item.datasetId))item.datasetId='';item.relatedDatasetIds=ids.filter(x=>state.datasets.some(d=>d.id===x));renderConversationList();renderMessages();saveConversations();showView('chat'); }
+function addConversation() { const item=createConversation();item.datasetId=$('#chat-dataset').value||'';item.relatedDatasetIds=[...$('#chat-secondary-dataset').selectedOptions].map(x=>x.value);item.secondaryDatasetId=item.relatedDatasetIds[0]||'';state.conversations.unshift(item);state.activeConversationId=item.id;saveConversations();renderConversationList();renderMessages();showView('chat');$('#question').focus(); }
 
 $('#new-conversation').onclick=addConversation;
 $('#conversation-list').onclick=e=>{const row=e.target.closest('[data-conversation-id]');if(!row)return;const id=row.dataset.conversationId,action=e.target.closest('[data-action]')?.dataset.action;if(action==='rename'){state.pendingDeleteId=null;const title=row.querySelector('.conversation-title');title.contentEditable='true';title.classList.add('editing');title.focus();document.getSelection()?.selectAllChildren(title);return}if(action==='delete'){if(state.conversations.length===1){toast('至少保留一个对话');return}if(state.pendingDeleteId!==id){state.pendingDeleteId=id;renderConversationList();toast('请再次点击“确认删除”');return}state.pendingDeleteId=null;state.conversations=state.conversations.filter(x=>x.id!==id);if(state.activeConversationId===id)state.activeConversationId=state.conversations[0].id;saveConversations();switchConversation(state.activeConversationId);toast('对话已删除');return}state.pendingDeleteId=null;switchConversation(id)};
@@ -64,15 +65,21 @@ async function loadDatasets() {
   const chatValue = $('#chat-dataset').value;
   $('#chat-dataset').innerHTML = datasetOptions();
   $('#chat-dataset').value = state.datasets.some(d => d.id === chatValue) ? chatValue : '';
-  const conversation=activeConversation();if(conversation){$('#chat-dataset').value=state.datasets.some(d=>d.id===conversation.datasetId)?conversation.datasetId:'';if(conversation.datasetId&&!state.datasets.some(d=>d.id===conversation.datasetId))conversation.datasetId='';saveConversations()}
+  const secondaryValue=[...$('#chat-secondary-dataset').selectedOptions].map(x=>x.value);
+  $('#chat-secondary-dataset').innerHTML='<option value="">自动选择数据表</option>'+state.datasets.map(d=>`<option value="${d.id}">${escapeHtml(d.name)}</option>`).join('');
+  [...$('#chat-secondary-dataset').options].forEach(x=>x.selected=secondaryValue.includes(x.value));
+  const conversation=activeConversation();if(conversation){$('#chat-dataset').value=state.datasets.some(d=>d.id===conversation.datasetId)?conversation.datasetId:'';const ids=conversation.relatedDatasetIds||(conversation.secondaryDatasetId?[conversation.secondaryDatasetId]:[]);[...$('#chat-secondary-dataset').options].forEach(x=>x.selected=ids.includes(x.value));if(conversation.datasetId&&!state.datasets.some(d=>d.id===conversation.datasetId))conversation.datasetId='';conversation.relatedDatasetIds=ids.filter(id=>state.datasets.some(d=>d.id===id));saveConversations()}
   $('#term-dataset-filter').innerHTML = datasetOptions(true);
   $('[name="dataset_id"]', $('#term-form')).innerHTML = '<option value="">全局术语</option>' + state.datasets.map(d => `<option value="${d.id}">${escapeHtml(d.name)}</option>`).join('');
   $('#dataset-list').innerHTML = state.datasets.length ? state.datasets.map(d => `
     <article class="card"><h3>${escapeHtml(d.name)}</h3><p>${escapeHtml(d.source_file)}</p><small>${d.row_count.toLocaleString()} 行 · ${d.columns.length} 个字段</small>
-    <div class="card-footer"><span>${new Date(d.created_at).toLocaleString()}</span><div><button class="ghost" data-preview-dataset="${d.id}">查看</button> <button class="danger" data-delete-dataset="${d.id}">删除</button></div></div></article>`).join('') : '<div class="empty">还没有数据表，上传一个 CSV 或 Excel 开始问数。</div>';
+    <div class="card-footer" style="align-items:stretch;flex-direction:column;gap:10px"><span>${new Date(d.created_at).toLocaleString()}</span><div style="display:flex;align-items:center;gap:8px"><button class="ghost" data-rename-dataset="${d.id}">重命名</button><button class="ghost" data-preview-dataset="${d.id}">查看</button><button class="danger" style="margin-left:auto;padding:9px 14px" data-delete-dataset="${d.id}">删除</button></div></div></article>`).join('') : '<div class="empty">还没有数据表，上传一个 CSV 或 Excel 开始问数。</div>';
+  updateRelationshipDatasetOptions();
+  await loadRelationships();
 }
 
 $('#chat-dataset').onchange=()=>{const item=activeConversation();if(item){item.datasetId=$('#chat-dataset').value;item.updatedAt=Date.now();saveConversations()}};
+$('#chat-secondary-dataset').onchange=()=>{const item=activeConversation();if(item){item.relatedDatasetIds=[...$('#chat-secondary-dataset').selectedOptions].map(x=>x.value);item.secondaryDatasetId=item.relatedDatasetIds[0]||'';item.updatedAt=Date.now();saveConversations()}};
 
 $('#upload-open').onclick = () => $('#upload-dialog').showModal();
 $('#term-open').onclick = () => {
@@ -83,6 +90,15 @@ $('#term-open').onclick = () => {
   $('#term-dialog').showModal();
 };
 $('#term-import-open').onclick = () => $('#term-import-dialog').showModal();
+$('#term-export').onclick = () => {
+  const link = document.createElement('a');
+  link.href = '/api/terms/export';
+  link.download = '';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  toast('术语库导出已开始');
+};
 $$('[data-close]').forEach(x => x.onclick = () => x.closest('dialog').close());
 
 $('#upload-form').onsubmit = async e => {
@@ -92,6 +108,25 @@ $('#upload-form').onsubmit = async e => {
 };
 
 $('#dataset-list').onclick = async e => {
+  const renameId = e.target.dataset.renameDataset;
+  if (renameId) {
+    const dataset = state.datasets.find(item => item.id === renameId);
+    if (!dataset) return;
+    const name = prompt('请输入新的数据表名称', dataset.name);
+    if (name === null) return;
+    const cleanedName = name.trim();
+    if (!cleanedName) { toast('数据表名称不能为空'); return; }
+    try {
+      await api(`/api/datasets/${renameId}`, {
+        method: 'PATCH',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name: cleanedName}),
+      });
+      await loadDatasets();
+      toast('数据表名称已更新');
+    } catch (err) { toast(err.message); }
+    return;
+  }
   const previewId = e.target.dataset.previewDataset;
   if (previewId) {
     const dataset = state.datasets.find(item => item.id === previewId);
@@ -115,6 +150,38 @@ $('#dataset-list').onclick = async e => {
   }
   const id = e.target.dataset.deleteDataset; if (!id || !confirm('确定删除这个数据表及其关联术语吗？')) return;
   try { await api(`/api/datasets/${id}`, {method:'DELETE'}); await loadDatasets(); toast('数据表已删除'); } catch(err) { toast(err.message); }
+};
+
+function relationshipDatasetOptions(selected='') {
+  return state.datasets.map(d=>`<option value="${d.id}" ${d.id===selected?'selected':''}>${escapeHtml(d.name)}</option>`).join('');
+}
+function updateRelationshipFields(side) {
+  const form=$('#relationship-form'),dataset=state.datasets.find(d=>d.id===form.elements[`${side}_dataset_id`].value);
+  const current=form.elements[`${side}_field`].value;
+  form.elements[`${side}_field`].innerHTML=(dataset?.columns||[]).map(c=>`<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)} · ${escapeHtml(c.type)}</option>`).join('');
+  if((dataset?.columns||[]).some(c=>c.name===current))form.elements[`${side}_field`].value=current;
+}
+function updateRelationshipDatasetOptions() {
+  const form=$('#relationship-form');if(!form)return;
+  for(const side of ['left','right']){const select=form.elements[`${side}_dataset_id`],value=select.value;select.innerHTML=relationshipDatasetOptions(value);if(state.datasets.some(d=>d.id===value))select.value=value;updateRelationshipFields(side)}
+}
+async function loadRelationships() {
+  const rules=await api('/api/relationship-rules');
+  const pairs=(rules.join_key_pairs||[]).map(x=>`${escapeHtml(x[0])} = ${escapeHtml(x[1])}`).join('；');
+  const purposes=Object.entries(rules.table_purposes||{}).map(([name,value])=>`${escapeHtml(name)}：${escapeHtml(value.role)}`).join('<br>');
+  $('#relationship-rules').innerHTML=`<b>系统受控关联规则</b><p>${pairs}</p><p>${purposes}</p>`;
+  state.relationships=await api('/api/relationships');
+  $('#relationship-list').innerHTML=state.relationships.length?state.relationships.map(x=>`<article class="relationship-item"><div><b>${escapeHtml(x.name)}</b><small>${escapeHtml(x.left_dataset_name)}.${escapeHtml(x.left_field)} = ${escapeHtml(x.right_dataset_name)}.${escapeHtml(x.right_field)}</small><span>${escapeHtml(x.meaning)}</span><small>粒度：${escapeHtml(x.left_grain)} ↔ ${escapeHtml(x.right_grain)}</small></div><div><span class="relationship-status ${x.enabled?'enabled':''}">${x.enabled?'已启用':'已停用'}</span><button class="ghost" data-check-relationship="${x.id}">检查关联</button><button class="ghost" data-edit-relationship="${x.id}">编辑</button><button class="ghost" data-toggle-relationship="${x.id}">${x.enabled?'停用':'启用'}</button><button class="danger" data-delete-relationship="${x.id}">删除</button></div></article>`).join(''):'<div class="empty">尚未配置表关联关系。系统不会猜测 target_id 或 MMSI 的对应关系。</div>';
+}
+$('#relationship-form [name=left_dataset_id]').onchange=()=>updateRelationshipFields('left');
+$('#relationship-form [name=right_dataset_id]').onchange=()=>updateRelationshipFields('right');
+$('#relationship-open').onclick=()=>{state.editingRelationshipId=null;const form=$('#relationship-form');form.reset();updateRelationshipDatasetOptions();$('.modal-head h3',form).textContent='新增表关联关系';$('button.primary',form).textContent='保存关系';$('#relationship-dialog').showModal()};
+$('#relationship-form').onsubmit=async e=>{e.preventDefault();const data=Object.fromEntries(new FormData(e.target));data.enabled=e.target.elements.enabled.checked;const id=state.editingRelationshipId;try{await api(id?`/api/relationships/${id}`:'/api/relationships',{method:id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});e.target.reset();state.editingRelationshipId=null;$('#relationship-dialog').close();await loadRelationships();toast(id?'关系已更新':'关系已保存')}catch(err){toast(err.message)}};
+$('#relationship-list').onclick=async e=>{const edit=e.target.dataset.editRelationship,toggle=e.target.dataset.toggleRelationship,del=e.target.dataset.deleteRelationship,check=e.target.dataset.checkRelationship;
+  if(edit){const x=state.relationships.find(item=>item.id===edit);if(!x)return;state.editingRelationshipId=edit;const form=$('#relationship-form');form.elements.name.value=x.name;form.elements.left_dataset_id.innerHTML=relationshipDatasetOptions(x.left_dataset_id);form.elements.left_dataset_id.value=x.left_dataset_id;updateRelationshipFields('left');form.elements.left_field.value=x.left_field;form.elements.right_dataset_id.innerHTML=relationshipDatasetOptions(x.right_dataset_id);form.elements.right_dataset_id.value=x.right_dataset_id;updateRelationshipFields('right');form.elements.right_field.value=x.right_field;form.elements.meaning.value=x.meaning;form.elements.left_grain.value=x.left_grain;form.elements.right_grain.value=x.right_grain;form.elements.enabled.checked=x.enabled;$('.modal-head h3',form).textContent='编辑表关联关系';$('button.primary',form).textContent='保存修改';$('#relationship-dialog').showModal();return}
+  if(toggle){const x=state.relationships.find(item=>item.id===toggle);try{await api(`/api/relationships/${toggle}/status`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:!x.enabled})});await loadRelationships();toast(x.enabled?'关系已停用':'关系已启用')}catch(err){toast(err.message)}return}
+  if(del&&confirm('确定删除这条表关联关系吗？')){try{await api(`/api/relationships/${del}`,{method:'DELETE'});await loadRelationships();toast('关系已删除')}catch(err){toast(err.message)}return}
+  if(check){$('#relationship-check-result').innerHTML='<p>正在检查字段数据…</p>';$('#relationship-check-dialog').showModal();try{const x=await api(`/api/relationships/${check}/check`);const side=(label,v)=>`<div class="check-card"><b>${label}</b><span>字段类型：${escapeHtml(v.field_type)}</span><span>总行数：${v.total_rows}，空值：${v.null_rows}</span><span>非空唯一键：${v.distinct_non_null}，重复键：${v.duplicate_keys}</span></div>`;$('#relationship-check-result').innerHTML=`<div class="relationship-check-grid">${side('左侧字段',x.left)}${side('右侧字段',x.right)}</div><p>两侧匹配的不同键：<b>${x.matched_distinct_keys}</b></p><p>字段类型${x.type_compatible?'一致':'不一致'}</p><p class="dialog-tip">${escapeHtml(x.advisory)}</p>`}catch(err){$('#relationship-check-result').innerHTML=`<div class="empty">${escapeHtml(err.message)}</div>`}}
 };
 
 async function loadTerms() {
@@ -170,9 +237,9 @@ $$('[data-provider]').forEach(button => button.onclick = () => {
 });
 $('#toggle-key').onclick = () => { const x=$('#api-key');x.type=x.type==='password'?'text':'password';$('#toggle-key').textContent=x.type==='password'?'显示':'隐藏'; };
 function readModel() { return {api_key:$('#api-key').value.trim(),base_url:$('#base-url').value.trim(),model:$('#model-name').value.trim()}; }
-function saveModel() { state.model=readModel();sessionStorage.setItem('smart-query-model',JSON.stringify(state.model));updateModelStatus(); }
+function saveModel() { state.model=readModel();localStorage.setItem(MODEL_CONFIG_KEY,JSON.stringify(state.model));sessionStorage.removeItem(MODEL_CONFIG_KEY);updateModelStatus(); }
 function updateModelStatus(){const el=$('.status');el.classList.toggle('ready',!!state.model);$('#model-status').textContent=state.model?state.model.model:'未配置模型'}
-$('#model-form').onsubmit = e => { e.preventDefault();saveModel();toast('模型配置已保存到当前会话');showView('chat'); };
+$('#model-form').onsubmit = e => { e.preventDefault();saveModel();toast('模型配置已保存到此浏览器');showView('chat'); };
 $('#test-model').onclick = async () => { const el=$('#model-result');el.textContent='正在测试连接…';try{const result=await api('/api/model/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(readModel())});el.textContent=`✓ ${result.message}`;}catch(err){el.textContent=`连接失败：${err.message}`;} };
 
 function splitAnswerSections(content) {
@@ -194,7 +261,14 @@ function splitAnswerSections(content) {
   return sections;
 }
 function renderSection(title, body) { return body ? `<section class="answer-section"><b>${escapeHtml(title)}</b><div class="answer-section-body">${escapeHtml(body)}</div></section>` : ''; }
-function renderAnswerContent(content) {
+function renderMatchedTerms(details) {
+  if (!details) return '';
+  const retrieval=details.route?.term_retrieval||{},items=details.terms||[];
+  if (!items.length) return `<section class="answer-section matched-terms"><b>命中术语</b><div class="answer-section-body"><small>检索方式：${escapeHtml(retrieval.method||'keyword')}</small><div class="matched-term"><span>未命中相关术语</span></div></div></section>`;
+  const body=items.map(x=>`<div class="matched-term"><strong>${escapeHtml(x.term)}</strong><span>${escapeHtml(x.definition)}</span><small>匹配来源：${escapeHtml((x.match_sources||[]).join('＋')||'--')}${x.semantic_score==null?'':` · 相似度：${escapeHtml(x.semantic_score)}`}</small></div>`).join('');
+  return `<section class="answer-section matched-terms"><b>命中术语</b><details class="matched-terms-list"><summary>命中 ${items.length} 条 · ${escapeHtml(retrieval.method||'keyword')}，点击展开</summary><div class="answer-section-body">${body}</div></details></section>`;
+}
+function renderAnswerContent(content, details) {
   const sections = splitAnswerSections(content);
   if (!sections['直接结论'] && !sections['结果明细']) return escapeHtml(content);
   const visible = `${renderSection('直接结论', sections['直接结论'])}${renderSection('结果明细', sections['结果明细'])}`;
@@ -209,26 +283,36 @@ function addMessage(role, content, details, persist = true) {
     const metrics=details.metrics||{},tokens=metrics.total_tokens==null?'模型未返回':metrics.total_tokens.toLocaleString();
     const sqlTime = metrics.sql_generation_cached ? '缓存命中' : formatDuration(metrics.sql_generation_elapsed_ms);
     const codeRequests=details.route?.code_lookup_requests||[],codeVersion=details.route?.code_dictionary_version;
+    const termDetails=renderMatchedTerms(details);
+    const relation=details.route?.relationship;
+    const relationDetails=relation?`<section class="reasoning-summary"><b>实际表关联</b><p>${escapeHtml(relation.left_dataset_name)}.${escapeHtml(relation.left_field)} = ${escapeHtml(relation.right_dataset_name)}.${escapeHtml(relation.right_field)}</p><p>${escapeHtml(relation.meaning)}</p><p>记录粒度：${escapeHtml(relation.left_grain)} ↔ ${escapeHtml(relation.right_grain)}</p></section>`:'';
     const codeBadge=codeRequests.length?`<span>编码映射 <b>v${escapeHtml(codeVersion||'--')} · ${codeRequests.length} 个字段</b></span>`:'';
     const codeDetails=codeRequests.length?`<section class="reasoning-summary"><b>字段编码映射</b>${codeRequests.map(x=>`<p>${escapeHtml(x.table)}.${escapeHtml(x.column)} · ${escapeHtml(x.code_type)} · ${escapeHtml(x.purpose)}${x.mention?` · “${escapeHtml(x.mention)}” → ${escapeHtml((x.code_values||[]).join(', '))}`:''}</p>`).join('')}</section>`:'';
-    extra=`<div class="run-stats"><span>总耗时 <b>${formatDuration(metrics.total_elapsed_ms)}</b></span><span>Token <b>${tokens}</b></span>${codeBadge}${metrics.sql_generation_cached?'<span>SQL <b>缓存命中</b></span>':''}</div><details class="meta-panel"><summary>查看 SQL 生成过程、SQL 和查询结果</summary><section class="reasoning-summary"><b>SQL 生成依据</b><p>${escapeHtml(details.reasoning_summary||'暂无生成依据记录')}</p></section>${codeDetails}<div class="metric-grid"><span>SQL 生成<strong>${sqlTime} · ${formatTokens(metrics.sql_generation_tokens)}</strong></span><span>数据库查询<strong>${formatDuration(metrics.query_elapsed_ms)}</strong></span><span>答案生成<strong>${formatDuration(metrics.answer_generation_elapsed_ms)} · ${formatTokens(metrics.answer_generation_tokens)}</strong></span><span>Token 明细<strong>输入 ${formatTokens(metrics.prompt_tokens)} / 输出 ${formatTokens(metrics.completion_tokens)}</strong></span></div><pre>${escapeHtml(details.sql)}</pre>${rows?`<div class="result-table"><table><thead><tr>${heads}</tr></thead><tbody>${rows}</tbody></table></div>`:'<p>查询结果为空</p>'}</details>`;
+    extra=`<div class="run-stats"><span>总耗时 <b>${formatDuration(metrics.total_elapsed_ms)}</b></span><span>Token <b>${tokens}</b></span>${codeBadge}${metrics.sql_generation_cached?'<span>SQL <b>缓存命中</b></span>':''}</div><details class="meta-panel"><summary>查看 SQL 生成过程、SQL 和查询结果</summary>${termDetails}${relationDetails}<section class="reasoning-summary"><b>SQL 生成依据</b><p>${escapeHtml(details.reasoning_summary||'暂无生成依据记录')}</p></section>${codeDetails}<div class="metric-grid"><span>SQL 生成<strong>${sqlTime} · ${formatTokens(metrics.sql_generation_tokens)}</strong></span><span>数据库查询<strong>${formatDuration(metrics.query_elapsed_ms)}</strong></span><span>答案生成<strong>${formatDuration(metrics.answer_generation_elapsed_ms)} · ${formatTokens(metrics.answer_generation_tokens)}</strong></span><span>Token 明细<strong>输入 ${formatTokens(metrics.prompt_tokens)} / 输出 ${formatTokens(metrics.completion_tokens)}</strong></span></div><pre>${escapeHtml(details.sql)}</pre>${rows?`<div class="result-table"><table><thead><tr>${heads}</tr></thead><tbody>${rows}</tbody></table></div>`:'<p>查询结果为空</p>'}</details>`;
   }
-  const renderedContent = role === 'assistant' ? renderAnswerContent(content) : escapeHtml(content);
+  const renderedContent = role === 'assistant' ? renderAnswerContent(content, details) : escapeHtml(content);
   wrap.innerHTML=`<div class="bubble">${renderedContent}${extra}</div>`;$('#messages').append(wrap);$('#messages').scrollTop=$('#messages').scrollHeight;if(persist){const item=activeConversation();if(item){item.messages.push({role,content,details:details||null});item.updatedAt=Date.now();if(item.title==='新对话'&&role==='user')item.title=content.slice(0,18);saveConversations();renderConversationList()}}return wrap;
 }
 function formatDuration(ms){if(ms==null)return'--';return ms<1000?`${ms} ms`:`${(ms/1000).toFixed(2)} s`}
 function formatTokens(value){return value==null?'-- Token':`${Number(value).toLocaleString()} Token`}
 $('#messages').onclick=e=>{const button=e.target.closest('.examples button');if(button){$('#question').value=button.textContent;$('#question').focus()}};
 $('#ask-form').onsubmit = async e => {
-  e.preventDefault();const question=$('#question').value.trim(),dataset_id=$('#chat-dataset').value||null;if(!question)return;if(!state.datasets.length){toast('请先上传数据表');showView('datasets');return}if(!state.model){toast('请先配置模型 API');showView('settings');return}
+  e.preventDefault();const question=$('#question').value.trim(),dataset_id=$('#chat-dataset').value||null,related_dataset_ids=[...$('#chat-secondary-dataset').selectedOptions].map(x=>x.value),dataset_ids=dataset_id?[dataset_id,...related_dataset_ids.filter(id=>id!==dataset_id)]:[];if(!question)return;if(related_dataset_ids.length&&!dataset_id){toast('手动选择关联表时请先选择主数据表');return}if(!state.datasets.length){toast('请先上传数据表');showView('datasets');return}if(!state.model){toast('请先配置模型 API');showView('settings');return}
   const conversationId=state.activeConversationId;addMessage('user',question);$('#question').value='';const loading=addMessage('assistant','正在检索术语、生成 SQL 并查询数据…',null,false);$('.send').disabled=true;
   const finish=(content,details=null)=>{loading.remove();const item=state.conversations.find(x=>x.id===conversationId);if(!item)return;if(state.activeConversationId===conversationId)addMessage('assistant',content,details);else{item.messages.push({role:'assistant',content,details});item.updatedAt=Date.now();saveConversations();renderConversationList()}};
-  try{const result=await api('/api/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset_id,question,model:state.model})});finish(result.answer,result)}catch(err){finish(`问数失败：${err.message}`)}finally{$('.send').disabled=false}
+  try{const secondary_dataset_id=related_dataset_ids[0]||null;const result=await api('/api/ask',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dataset_id,secondary_dataset_id,dataset_ids,question,model:state.model})});finish(result.answer,result)}catch(err){finish(`问数失败：${err.message}`)}finally{$('.send').disabled=false}
 };
 
 try { state.conversations=JSON.parse(localStorage.getItem(CONVERSATIONS_KEY)||sessionStorage.getItem(CONVERSATIONS_KEY))||[]; } catch {}
 if(!Array.isArray(state.conversations)||!state.conversations.length)state.conversations=[createConversation()];
 state.activeConversationId=localStorage.getItem(ACTIVE_CONVERSATION_KEY)||sessionStorage.getItem(ACTIVE_CONVERSATION_KEY);if(!state.conversations.some(x=>x.id===state.activeConversationId))state.activeConversationId=state.conversations[0].id;saveConversations();
-try { state.model=JSON.parse(sessionStorage.getItem('smart-query-model')); } catch {}
+try {
+  const savedModel=localStorage.getItem(MODEL_CONFIG_KEY)||sessionStorage.getItem(MODEL_CONFIG_KEY);
+  state.model=JSON.parse(savedModel);
+  if(state.model&&savedModel&&!localStorage.getItem(MODEL_CONFIG_KEY)){
+    localStorage.setItem(MODEL_CONFIG_KEY,savedModel);
+    sessionStorage.removeItem(MODEL_CONFIG_KEY);
+  }
+} catch {}
 if(state.model){$('#api-key').value=state.model.api_key;$('#base-url').value=state.model.base_url;$('#model-name').value=state.model.model}
 updateModelStatus();renderConversationList();renderMessages();loadDatasets().then(()=>{const requested=new URLSearchParams(location.search).get('view');if(requested&&titles[requested])showView(requested)}).catch(err=>toast(err.message));
