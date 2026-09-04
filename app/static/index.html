@@ -7,7 +7,7 @@
   <link rel="stylesheet" href="/static/style.css?v=20260902-matched-terms-collapse" />
   <link rel="stylesheet" href="/static/code_admin.css?v=20260827-grouped" />
   <link rel="stylesheet" href="/static/code_admin_overrides.css?v=20260827-inner-scroll-only" />
-  <link rel="stylesheet" href="/static/relationships.css?v=20260902-two-table" />
+  <link rel="stylesheet" href="/static/relationships.css?v=20260904-join-fields-clean" />
   <style>@media (min-width: 761px) { .conversation-list { max-height: 50vh; } }</style>
 </head>
 <body>
@@ -41,7 +41,7 @@
         <div class="section-head"><div><h2>数据表</h2><p>上传 CSV 或 Excel，系统将自动识别字段与类型。</p></div><button class="primary" id="upload-open">＋ 上传数据表</button></div>
         <div id="dataset-list" class="cards"></div>
         <section class="relationship-panel">
-          <div class="section-head"><div><h2>多表识别规则</h2><p>系统先识别主事实表，再按受控字段对、术语、字段和表用途评分补充关联表。</p></div><button class="primary" id="relationship-open" hidden>＋ 新增关系</button></div>
+          <div class="section-head"><div><h2>多表识别规则</h2><p>了解系统什么时候会跨表、怎样选择关联表，以及 SQL 会受到哪些安全约束。</p></div><button class="primary" id="relationship-open" hidden>＋ 新增关系</button></div>
           <div id="relationship-rules" class="reasoning-summary"></div>
           <div id="relationship-list" class="term-list" hidden></div>
         </section>
@@ -91,7 +91,7 @@
   </form></dialog>
   <dialog id="relationship-check-dialog" style="width:min(760px,92vw)"><form method="dialog"><div class="modal-head"><h3>关联检查</h3><button type="button" data-close>×</button></div><div id="relationship-check-result"></div><div class="actions"><button class="ghost">关闭</button></div></form></dialog>
   <div id="toast"></div>
-  <script src="/static/app.js?v=20260903-term-export"></script>
+  <script src="/static/app.js?v=20260904-join-fields-clean"></script>
   <script src="/static/code_admin.js?v=20260827-one-line-title"></script>
 </body>
 </html>

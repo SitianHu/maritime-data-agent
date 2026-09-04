@@ -167,9 +167,38 @@ function updateRelationshipDatasetOptions() {
 }
 async function loadRelationships() {
   const rules=await api('/api/relationship-rules');
-  const pairs=(rules.join_key_pairs||[]).map(x=>`${escapeHtml(x[0])} = ${escapeHtml(x[1])}`).join('；');
-  const purposes=Object.entries(rules.table_purposes||{}).map(([name,value])=>`${escapeHtml(name)}：${escapeHtml(value.role)}`).join('<br>');
-  $('#relationship-rules').innerHTML=`<b>系统受控关联规则</b><p>${pairs}</p><p>${purposes}</p>`;
+  const allowedFields=new Set((rules.join_key_pairs||[]).flat());
+  const fieldMeanings={target_id:'船舶目标标识',mmsi:'船舶 MMSI 标识',imo:'船舶 IMO 编号',event_uuid:'事件唯一标识'};
+  const tableJoinFields=state.datasets.map(dataset=>{
+    const fields=(dataset.columns||[]).map(column=>column.name).filter(name=>allowedFields.has(name));
+    const purpose=rules.table_purposes?.[dataset.name]||rules.table_purposes?.[dataset.table_name];
+    return `<li><div><strong>${escapeHtml(dataset.name)}</strong>${purpose?`<span>${escapeHtml(purpose.role)}</span>`:''}</div><div class="table-join-fields">${fields.map(name=>`<code title="${escapeHtml(fieldMeanings[name]||'关联标识')}">${escapeHtml(name)}</code>`).join('')||'<em>无可用 JOIN 字段</em>'}</div></li>`;
+  }).join('');
+  const actualConnections=[];
+  for(let leftIndex=0;leftIndex<state.datasets.length;leftIndex++){
+    for(let rightIndex=leftIndex+1;rightIndex<state.datasets.length;rightIndex++){
+      const left=state.datasets[leftIndex],right=state.datasets[rightIndex];
+      const leftFields=new Set((left.columns||[]).map(x=>x.name)),rightFields=new Set((right.columns||[]).map(x=>x.name));
+      const match=(rules.join_key_pairs||[]).find(([leftField,rightField])=>leftFields.has(leftField)&&rightFields.has(rightField));
+      const reverse=(rules.join_key_pairs||[]).find(([leftField,rightField])=>leftFields.has(rightField)&&rightFields.has(leftField));
+      const selected=match||reverse;
+      if(!selected)continue;
+      const leftField=match?selected[0]:selected[1],rightField=match?selected[1]:selected[0];
+      actualConnections.push(`<li><span class="connection-table">${escapeHtml(left.name)}</span><code>${escapeHtml(leftField)}</code><b>=</b><span class="connection-table">${escapeHtml(right.name)}</span><code>${escapeHtml(rightField)}</code></li>`);
+    }
+  }
+  $('#relationship-rules').innerHTML=`
+    <section class="table-join-field-list">
+      <h3>各数据表用于 JOIN 的字段</h3>
+      <p>先看每张表右侧的关联字段：只有这些字段会参与多表连接。字段相同可以直接对应，<code>target_id</code> 与 <code>mmsi</code> 也允许互相连接。</p>
+      <ul>${tableJoinFields||'<li><div><strong>暂无数据表</strong></div></li>'}</ul>
+      <div class="join-field-legend"><span><code>target_id</code> 船舶目标标识</span><span><code>mmsi</code> 船舶 MMSI 标识</span><span><code>imo</code> 船舶 IMO 编号</span><span><code>event_uuid</code> 事件唯一标识</span></div>
+    </section>
+    <section class="actual-connections">
+      <h3>当前数据表的实际连接清单 <small>共 ${actualConnections.length} 条</small></h3>
+      <p>系统生成多表 SQL 时，只会使用下面列出的表和字段关系。每对数据表按受控规则优先级选择一个连接条件。</p>
+      <ul>${actualConnections.join('')||'<li class="connection-empty">当前数据表之间没有找到可用的受控关联字段。</li>'}</ul>
+    </section>`;
   state.relationships=await api('/api/relationships');
   $('#relationship-list').innerHTML=state.relationships.length?state.relationships.map(x=>`<article class="relationship-item"><div><b>${escapeHtml(x.name)}</b><small>${escapeHtml(x.left_dataset_name)}.${escapeHtml(x.left_field)} = ${escapeHtml(x.right_dataset_name)}.${escapeHtml(x.right_field)}</small><span>${escapeHtml(x.meaning)}</span><small>粒度：${escapeHtml(x.left_grain)} ↔ ${escapeHtml(x.right_grain)}</small></div><div><span class="relationship-status ${x.enabled?'enabled':''}">${x.enabled?'已启用':'已停用'}</span><button class="ghost" data-check-relationship="${x.id}">检查关联</button><button class="ghost" data-edit-relationship="${x.id}">编辑</button><button class="ghost" data-toggle-relationship="${x.id}">${x.enabled?'停用':'启用'}</button><button class="danger" data-delete-relationship="${x.id}">删除</button></div></article>`).join(''):'<div class="empty">尚未配置表关联关系。系统不会猜测 target_id 或 MMSI 的对应关系。</div>';
 }

@@ -9,6 +9,6 @@ data/uploads/
 data/fm_code.xlsx
 data/models/
 tests/
-!tests/
-!tests/*.py
+# !tests/
+# !tests/*.py
 
